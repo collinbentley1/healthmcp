@@ -10,7 +10,7 @@ https://medlock.ai/api/mcp
 
 The same service also answers at `https://mcp.medlock.ai/api/mcp`. The path is `/api/mcp` on both hosts; there is no `/mcp` route, and the root of `mcp.medlock.ai` serves the site, not the protocol (probed 2026-07-08; see [Verify the endpoint yourself](#verify-the-endpoint-yourself)).
 
-**The public deployment serves demo data and says so in the protocol itself.** Responses are deterministic demo vitals (`src/vitals.ts`), and every connecting client is told: the server's `initialize` instructions state that this deployment uses demo Solid Pod data until a user connects their own pod (`src/mcp.ts`), the `solid_fetch_vitals` tool description repeats it, every tool result is tagged `source: "demo-solid-pod"`, and the `medlock://context` resource reports `healthDataMode: "demo-solid-pod"`. For a health-data-shaped demo this disclosure is load-bearing: a model reading this surface has no path to presenting synthetic readings as someone's real vitals.
+**The public deployment serves demo data and says so in the protocol itself.** Responses are deterministic demo vitals (`src/vitals.ts`), and every connecting client is told: the server's `initialize` instructions state that this deployment uses demo Solid Pod data until a user connects their own pod (`src/mcp.ts`), the `solid_fetch_vitals` tool description repeats it, every tool result is tagged `source: "demo-solid-pod"`, and the `medlock://context` resource reports `healthDataMode: "demo-solid-pod"`. For a health-data-shaped demo this disclosure is load-bearing: a model reading this surface is told at every layer that the readings are demo data, not someone's real vitals.
 
 ## Install in Claude in 60 seconds
 
