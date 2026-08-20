@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   cleanup:
-    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@v0.1.2
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@v0.2.0
     with:
       project-id: medlock-1025243085
       region: us-east4

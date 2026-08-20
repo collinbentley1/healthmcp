@@ -4,6 +4,6 @@
   "region": "us-east4",
   "serviceName": "medlock",
   "artifactRegistryRepository": "site",
-  "platformVersion": "v0.1.2",
+  "platformVersion": "v0.2.0",
   "runtimeConfigScript": ".github/platform/runtime-config.sh"
 }

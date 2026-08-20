@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   deploy:
-    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@v0.1.2
+    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@v0.2.0
     with:
       project-id: medlock-1025243085
       region: us-east4
