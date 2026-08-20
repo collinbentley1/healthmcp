@@ -13,7 +13,7 @@ permissions:
 jobs:
   verify:
     name: Bun verify
-    uses: collinbentley1/platform/.github/workflows/application.yml@v0.1.2
+    uses: collinbentley1/platform/.github/workflows/application.yml@v0.3.1
     with:
-      bun-version: canary
+      bun-version: 1.4.0
       verify-command: bun run verify

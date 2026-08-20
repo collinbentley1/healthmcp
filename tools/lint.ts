@@ -5,7 +5,7 @@ const root = join(import.meta.dir, "..");
 const failures: string[] = [];
 
 await requireContains("Dockerfile", "dhi.io/bun", "Dockerfile must use Docker Hardened Bun images.");
-await requireContains("Dockerfile", "bun upgrade --canary", "Dockerfile must upgrade Bun to the latest canary.");
+await requireContains("Dockerfile", "bun-v1.4.0", "Dockerfile must pin Bun 1.4.0.");
 await requireContains("public/index.html", 'rel="icon"', "The document must link a favicon.");
 await requireContains("tools/build.ts", "scan.html", "The production build must include the scan handoff page.");
 await requireContains("src/mcp.ts", "WebStandardStreamableHTTPServerTransport", "MCP must use the web-standard Streamable HTTP transport.");
