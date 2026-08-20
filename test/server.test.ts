@@ -26,6 +26,14 @@ describe("server", () => {
     expect(favicon.headers.get("Content-Type")).toBe("image/svg+xml");
   });
 
+  test("serves the platform liveness probe at /livez", async () => {
+    const handler = createHandler({ config });
+    const response = await handler(new Request("http://localhost/livez"));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+  });
+
   test("sends HSTS on page and redirect responses", async () => {
     const handler = createHandler({ config });
     const page = await handler(new Request("http://localhost/"));
