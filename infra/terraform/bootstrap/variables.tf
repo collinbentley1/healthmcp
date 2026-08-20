@@ -31,7 +31,7 @@ variable "github_owner" {
 variable "github_repo" {
   description = "GitHub repository name."
   type        = string
-  default     = "medlock"
+  default     = "healthmcp"
 }
 
 variable "github_owner_id" {
