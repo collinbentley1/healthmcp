@@ -31,6 +31,11 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
   const now = dependencies.now ?? (() => new Date());
 
   return async function handleRequest(request: Request): Promise<Response> {
+    const healthUrl = new URL(request.url);
+    if (healthUrl.pathname === "/livez") {
+      return Response.json({ ok: true });
+    }
+
     const canonicalRedirect = shouldRedirectToCanonical(request, config);
     if (canonicalRedirect) {
       return withSecurityHeaders(new Response(null, { headers: { Location: canonicalRedirect.href }, status: 308 }));
