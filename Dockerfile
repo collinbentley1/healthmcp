@@ -4,9 +4,10 @@ FROM dhi.io/bun:1-dev@sha256:67209598b7e7db266ae5630f9b27662d3a80b0915615bbcb9f7
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install --no-install-recommends --yes unzip \
+  && apt-get install --no-install-recommends --yes curl unzip \
   && rm -rf /var/lib/apt/lists/* \
-  && bun upgrade --canary
+  && curl -fsSL https://bun.com/install | BUN_INSTALL=/usr/local bash -s "bun-v1.4.0"
+RUN bun -e 'if (Bun.version !== "1.4.0") throw new Error("Bun 1.4 native image requires Bun 1.4.0, got " + Bun.version)'
 
 COPY package.json bun.lock bunfig.toml tsconfig.json ./
 RUN bun ci
@@ -27,6 +28,7 @@ ENV PORT=8080
 ENV PUBLIC_DIR=/app/dist/public
 
 COPY --from=deps /usr/local/bin/bun /usr/local/bin/bun
+RUN ["bun", "-e", "if (Bun.version !== \"1.4.0\") throw new Error(\"Bun 1.4 native image requires Bun 1.4.0, got \" + Bun.version)"]
 COPY --from=build /app/dist ./dist
 
 EXPOSE 8080
