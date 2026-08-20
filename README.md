@@ -54,7 +54,7 @@ Each claim below cites the file that implements it.
 - **Origin and host allow-listing.** MCP requests from origins outside the allow-list get 403; the same applies to unrecognized `Host` values (`isTrustedOrigin`/`isTrustedHost` in `src/http.ts`, enforced in `src/mcp.ts`; defaults, including `https://claude.ai` and `https://chat.openai.com`, in `src/config.ts`). CORS headers echo only allow-listed origins.
 - **Rate limiting.** An in-memory limiter (`src/rate-limit.ts`) caps the waitlist API at 5 requests per minute per client IP (`handleWaitlist()` in `src/server.ts`). The MCP endpoint itself is not rate-limited in application code.
 - **Response headers.** Site pages and API responses carry a CSP with `default-src 'self'` and no `unsafe-inline`, `frame-ancestors 'none'`, COOP/CORP `same-origin`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a Permissions-Policy disabling camera, geolocation, microphone, and payment (`SECURITY_HEADERS` in `src/http.ts`). API CORS advertises only POST and OPTIONS and echoes only allow-listed origins.
-- **Request body limits.** Bun rejects request bodies larger than 1 MiB, and the waitlist route additionally reads at most 8 KiB before parsing JSON (`src/server.ts`).
+- **Request body limits.** Bun rejects request bodies larger than 1 MiB, MCP reads at most 64 KiB and rejects JSON-RPC batches, and the waitlist route reads at most 8 KiB before parsing JSON (`src/mcp.ts`, `src/server.ts`).
 - **Honest demo data.** Deterministic sample vitals (`src/vitals.ts`) with the disclosure wired through the protocol surface as described above (`src/mcp.ts`).
 - **Waitlist storage hashes what it can.** Waitlist entries store SHA-256 hashes of IP and user agent alongside the email (`src/waitlist.ts`).
 

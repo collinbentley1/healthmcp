@@ -124,6 +124,7 @@ describe("initialize probe", () => {
 
     const missing = await initialize(endpoint);
     expect(missing.status).toBe(401);
+    expect(missing.headers.get("WWW-Authenticate")).toBe('Bearer realm="medlock-mcp"');
 
     const wrong = await initialize(endpoint, { Authorization: "Bearer wrong" });
     expect(wrong.status).toBe(401);
@@ -131,5 +132,30 @@ describe("initialize probe", () => {
     const authorized = await initialize(endpoint, { Authorization: "Bearer probe-secret" });
     expect(authorized.status).toBe(200);
     expect(parseSseMessage(await authorized.text()).event).toBe("message");
+  });
+
+  test("rejects JSON-RPC batches and oversized MCP bodies", async () => {
+    const endpoint = serve();
+    const batch = await fetch(endpoint, {
+      body: JSON.stringify([INITIALIZE_BODY, { ...INITIALIZE_BODY, id: 2 }]),
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      method: "POST",
+    });
+    expect(batch.status).toBe(400);
+    expect(await batch.json()).toEqual({ error: "JSON-RPC batches are not supported" });
+
+    const oversized = await fetch(endpoint, {
+      body: JSON.stringify({ ...INITIALIZE_BODY, padding: "x".repeat(70_000) }),
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      method: "POST",
+    });
+    expect(oversized.status).toBe(413);
+    expect(await oversized.json()).toEqual({ error: "request body too large" });
   });
 });

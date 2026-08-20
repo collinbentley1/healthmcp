@@ -10,6 +10,7 @@ export type McpEndpoint = {
 };
 
 const vitalTypeSchema = z.enum(VITAL_TYPES);
+const MAX_MCP_BODY_SIZE = 65_536;
 const dateRangeSchema = z
   .object({
     end: z.string().datetime().optional().describe("Inclusive ISO 8601 end timestamp."),
@@ -76,12 +77,37 @@ export function createMcpEndpoint(config: RuntimeConfig): McpEndpoint {
         );
       }
 
-      const authInfo = authenticate(request, config);
-      if (!authInfo) {
-        return withCors(json({ error: "missing or invalid bearer token" }, { status: 401 }), request, config);
+      const mediaType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase();
+      if (mediaType !== "application/json") {
+        return withCors(json({ error: "expected application/json" }, { status: 415 }), request, config);
       }
 
-      return withCors(await handler.fetch(request, { authInfo }), request, config);
+      const authInfo = authenticate(request, config);
+      if (!authInfo) {
+        return withCors(
+          json(
+            { error: "missing or invalid bearer token" },
+            { headers: { "WWW-Authenticate": 'Bearer realm="medlock-mcp"' }, status: 401 },
+          ),
+          request,
+          config,
+        );
+      }
+
+      const parsedBody = await readBoundedJson(request.clone(), MAX_MCP_BODY_SIZE);
+      if (parsedBody.kind === "too-large") {
+        return withCors(json({ error: "request body too large" }, { status: 413 }), request, config);
+      }
+
+      if (parsedBody.kind === "invalid") {
+        return withCors(json({ error: "invalid JSON body" }, { status: 400 }), request, config);
+      }
+
+      if (Array.isArray(parsedBody.value)) {
+        return withCors(json({ error: "JSON-RPC batches are not supported" }, { status: 400 }), request, config);
+      }
+
+      return withCors(await handler.fetch(request, { authInfo, parsedBody: parsedBody.value }), request, config);
     },
   };
 }
@@ -232,4 +258,54 @@ function authenticate(request: Request, config: RuntimeConfig): AuthInfo | undef
     scopes: ["pod:read", "scan:prepare"],
     token: config.mcpBearerToken,
   };
+}
+
+type BoundedJsonResult =
+  | { readonly kind: "invalid" }
+  | { readonly kind: "ok"; readonly value: unknown }
+  | { readonly kind: "too-large" };
+
+async function readBoundedJson(request: Request, maxBytes: number): Promise<BoundedJsonResult> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0) {
+      return { kind: "invalid" };
+    }
+    if (declaredBytes > maxBytes) {
+      return { kind: "too-large" };
+    }
+  }
+
+  if (!request.body) {
+    return { kind: "invalid" };
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { kind: "too-large" };
+      }
+      chunks.push(value);
+    }
+
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { kind: "ok", value: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) };
+  } catch {
+    return { kind: "invalid" };
+  }
 }
