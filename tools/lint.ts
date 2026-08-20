@@ -8,7 +8,7 @@ await requireContains("Dockerfile", "dhi.io/bun", "Dockerfile must use Docker Ha
 await requireContains("Dockerfile", "bun-v1.4.0", "Dockerfile must pin Bun 1.4.0.");
 await requireContains("public/index.html", 'rel="icon"', "The document must link a favicon.");
 await requireContains("tools/build.ts", "scan.html", "The production build must include the scan handoff page.");
-await requireContains("src/mcp.ts", "WebStandardStreamableHTTPServerTransport", "MCP must use the web-standard Streamable HTTP transport.");
+await requireContains("src/mcp.ts", "createMcpHandler", "MCP must use the SDK's per-request HTTP handler factory.");
 await rejectExternalReferences("public/index.html", "https://medlock.ai/", "The frontend should not reference third-party assets.");
 await rejectContains("public/assets/styles.css", "@import", "Styles should not import third-party design libraries.");
 await rejectContains("src/client.ts", "react", "The frontend should stay framework-free.");

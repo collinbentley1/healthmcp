@@ -83,7 +83,7 @@ export function corsHeaders(request: Request, config: RuntimeConfig): Headers {
     headers.set("Vary", "Origin");
   }
 
-  headers.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
   headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, MCP-Protocol-Version, mcp-session-id");
   headers.set("Access-Control-Expose-Headers", "MCP-Protocol-Version, mcp-session-id");
   headers.set("Access-Control-Max-Age", "600");
@@ -96,11 +96,13 @@ export function withCors(response: Response, request: Request, config: RuntimeCo
     headers.set(key, value);
   }
 
-  return new Response(response.body, {
-    headers,
-    status: response.status,
-    statusText: response.statusText,
-  });
+  return withSecurityHeaders(
+    new Response(response.body, {
+      headers,
+      status: response.status,
+      statusText: response.statusText,
+    }),
+  );
 }
 
 export function isTrustedHost(request: Request, config: RuntimeConfig): boolean {

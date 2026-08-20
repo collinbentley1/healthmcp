@@ -87,4 +87,40 @@ describe("server", () => {
 
     expect((await handler(request())).status).toBe(429);
   });
+
+  test("rejects an oversized waitlist body before parsing or persistence", async () => {
+    const handler = createHandler({ config, waitlistStore: new MemoryWaitlistStore() });
+    const response = await handler(
+      new Request("http://localhost/api/waitlist", {
+        body: JSON.stringify({ email: `${"a".repeat(9_000)}@example.com` }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      }),
+    );
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({ error: "request body too large" });
+  });
+
+  test("does not expose thrown error details in API responses", async () => {
+    const handler = createHandler({
+      config,
+      mcpEndpoint: {
+        handle: () => Promise.reject(new Error("private stack marker")),
+      },
+    });
+    const response = await handler(
+      new Request("http://localhost/api/mcp", {
+        body: "{}",
+        headers: { "Content-Type": "application/json", Origin: "https://medlock.ai" },
+        method: "POST",
+      }),
+    );
+    const responseText = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(responseText).toBe('{"error":"internal server error"}');
+    expect(responseText).not.toContain("private stack marker");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("https://medlock.ai");
+  });
 });

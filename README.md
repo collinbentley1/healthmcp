@@ -48,12 +48,13 @@ claude mcp add --transport http medlock https://your-host/api/mcp \
 
 Each claim below cites the file that implements it.
 
-- **Streamable HTTP transport.** The MCP endpoint uses `WebStandardStreamableHTTPServerTransport` from `@modelcontextprotocol/server` (`src/mcp.ts`, `package.json`). `initialize` requests are answered as SSE `event: message` frames.
+- **Isolated Streamable HTTP transport.** The MCP endpoint uses the stable `createMcpHandler` per-request factory from `@modelcontextprotocol/server` (`src/mcp.ts`, `package.json`). Each POST gets a fresh MCP server instance, while legacy `initialize` requests retain their SSE `event: message` response.
 - **Single request handler.** `src/server.ts` routes `/api/mcp` to the MCP transport, `/api/waitlist` to the waitlist store, and everything else to static assets, with canonical-host 308 redirects for legacy domains (`src/http.ts`, `src/config.ts`).
 - **Bearer auth for private deployments.** When `MEDLOCK_MCP_TOKEN` is set, MCP requests without the matching `Authorization: Bearer` header get 401 (`authenticate()` in `src/mcp.ts`; `src/config.ts`). Without a token, requests run as an anonymous demo client with `demo:read` scope. The `medlock://context` resource states the rule: connect real Solid Pods only through a private deployment with the token configured (`src/mcp.ts`).
 - **Origin and host allow-listing.** MCP requests from origins outside the allow-list get 403; the same applies to unrecognized `Host` values (`isTrustedOrigin`/`isTrustedHost` in `src/http.ts`, enforced in `src/mcp.ts`; defaults, including `https://claude.ai` and `https://chat.openai.com`, in `src/config.ts`). CORS headers echo only allow-listed origins.
 - **Rate limiting.** An in-memory limiter (`src/rate-limit.ts`) caps the waitlist API at 5 requests per minute per client IP (`handleWaitlist()` in `src/server.ts`). The MCP endpoint itself is not rate-limited in application code.
-- **Response headers.** Site pages, API JSON, and error responses carry a CSP with `default-src 'self'` and no `unsafe-inline`, `frame-ancestors 'none'`, COOP/CORP `same-origin`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a Permissions-Policy disabling camera, geolocation, microphone, and payment (`SECURITY_HEADERS` in `src/http.ts`, applied via `json()`, `text()`, and the static file server in `src/server.ts`). Successful MCP protocol responses pass through the transport with allow-list CORS headers (`withCors` in `src/http.ts`) rather than the page-security set.
+- **Response headers.** Site pages and API responses carry a CSP with `default-src 'self'` and no `unsafe-inline`, `frame-ancestors 'none'`, COOP/CORP `same-origin`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a Permissions-Policy disabling camera, geolocation, microphone, and payment (`SECURITY_HEADERS` in `src/http.ts`). API CORS advertises only POST and OPTIONS and echoes only allow-listed origins.
+- **Request body limits.** Bun rejects request bodies larger than 1 MiB, and the waitlist route additionally reads at most 8 KiB before parsing JSON (`src/server.ts`).
 - **Honest demo data.** Deterministic sample vitals (`src/vitals.ts`) with the disclosure wired through the protocol surface as described above (`src/mcp.ts`).
 - **Waitlist storage hashes what it can.** Waitlist entries store SHA-256 hashes of IP and user agent alongside the email (`src/waitlist.ts`).
 
@@ -81,7 +82,7 @@ curl -sS -X POST https://medlock.ai/api/mcp \
 
 Expected: HTTP 200 with `content-type: text/event-stream` and an `event: message` frame whose result carries `serverInfo` (`"name": "medlock"`) and instructions disclosing the demo Solid Pod data.
 
-The same probe runs in CI as a contract test: `test/initialize-probe.test.ts` starts the server and asserts the SSE response shape, `serverInfo`, the demo-data disclosure, the 403 for non-allow-listed origins, and the 401 when a bearer token is configured but absent.
+The same probe runs in CI as a contract test: `test/initialize-probe.test.ts` starts the server and asserts the SSE response shape, `serverInfo`, the demo-data disclosure, the 403 for non-allow-listed origins, the 401 when a bearer token is configured but absent, and that a rejected DELETE cannot affect a later POST. Additional tests cover simultaneous duplicate JSON-RPC IDs and oversized waitlist bodies.
 
 ## Local Development
 
@@ -110,7 +111,7 @@ http://localhost:3000/api/mcp
 ## Stack
 
 - Bun for the HTTP server, static site build, tests, and tooling
-- `@modelcontextprotocol/server` with `WebStandardStreamableHTTPServerTransport`
+- `@modelcontextprotocol/server` with the `createMcpHandler` per-request factory
 - Cloud Run for production and pull request previews
 - Terraform for Google Cloud resources
 - GitHub Actions OIDC for GitOps deployment

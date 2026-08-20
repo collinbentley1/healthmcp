@@ -103,6 +103,20 @@ describe("initialize probe", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("https://claude.ai");
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBe("POST, OPTIONS");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+  });
+
+  test("rejects DELETE without affecting the next POST", async () => {
+    const endpoint = serve();
+    const deleted = await fetch(endpoint, { method: "DELETE" });
+
+    expect(deleted.status).toBe(405);
+    expect(deleted.headers.get("Allow")).toBe("POST, OPTIONS");
+
+    const initialized = await initialize(endpoint);
+    expect(initialized.status).toBe(200);
+    expect(parseSseMessage(await initialized.text()).data.id).toBe(1);
   });
 
   test("requires the bearer token when MEDLOCK_MCP_TOKEN is configured", async () => {

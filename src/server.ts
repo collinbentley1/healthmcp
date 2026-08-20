@@ -13,6 +13,9 @@ type ServerDependencies = {
   readonly waitlistStore?: WaitlistStore;
 };
 
+export const MAX_REQUEST_BODY_SIZE = 1_048_576;
+const MAX_WAITLIST_BODY_SIZE = 8_192;
+
 const CONTENT_TYPES: Readonly<Record<string, string>> = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -33,7 +36,7 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
   return async function handleRequest(request: Request): Promise<Response> {
     const healthUrl = new URL(request.url);
     if (healthUrl.pathname === "/livez") {
-      return Response.json({ ok: true });
+      return json({ ok: true });
     }
 
     const canonicalRedirect = shouldRedirectToCanonical(request, config);
@@ -49,7 +52,7 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
       }
 
       if (url.pathname === "/api/mcp") {
-        return mcpEndpoint.handle(request);
+        return await mcpEndpoint.handle(request);
       }
 
       if (url.pathname === "/scan") {
@@ -58,8 +61,10 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
 
       return serveStatic(url.pathname, config);
     } catch (error) {
-      console.error("request failed", error);
-      return json({ error: "internal server error" }, { status: 500 });
+      console.error("request failed", error instanceof Error ? error.name : "unknown error");
+      return url.pathname.startsWith("/api/")
+        ? apiJson({ error: "internal server error" }, request, config, { status: 500 })
+        : json({ error: "internal server error" }, { status: 500 });
     }
   };
 }
@@ -71,6 +76,7 @@ if (import.meta.main) {
   const server = Bun.serve({
     fetch: createHandler({ config }),
     hostname: "0.0.0.0",
+    maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
     port: config.port,
   });
 
@@ -108,7 +114,16 @@ async function handleWaitlist(
     return apiJson({ error: "expected application/json" }, request, config, { status: 415 });
   }
 
-  const body = (await request.json().catch(() => undefined)) as { email?: unknown; source?: unknown } | undefined;
+  const parsedBody = await readBoundedJson(request, MAX_WAITLIST_BODY_SIZE);
+  if (parsedBody.kind === "too-large") {
+    return apiJson({ error: "request body too large" }, request, config, { status: 413 });
+  }
+
+  if (parsedBody.kind === "invalid") {
+    return apiJson({ error: "invalid JSON body" }, request, config, { status: 400 });
+  }
+
+  const body = parsedBody.value as { email?: unknown; source?: unknown } | undefined;
   if (!body || typeof body.email !== "string") {
     return apiJson({ error: "email is required" }, request, config, { status: 400 });
   }
@@ -188,4 +203,59 @@ async function serveStatic(pathname: string, config: RuntimeConfig): Promise<Res
 function clientAddress(request: Request): string {
   const forwardedFor = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
   return forwardedFor || request.headers.get("x-real-ip") || request.headers.get("cf-connecting-ip") || "unknown";
+}
+
+type BoundedJsonResult =
+  | { readonly kind: "invalid" }
+  | { readonly kind: "ok"; readonly value: unknown }
+  | { readonly kind: "too-large" };
+
+async function readBoundedJson(request: Request, maxBytes: number): Promise<BoundedJsonResult> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0) {
+      return { kind: "invalid" };
+    }
+
+    if (declaredBytes > maxBytes) {
+      return { kind: "too-large" };
+    }
+  }
+
+  if (!request.body) {
+    return { kind: "invalid" };
+  }
+
+  const chunks: Uint8Array[] = [];
+  const reader = request.body.getReader();
+  let size = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { kind: "too-large" };
+      }
+
+      chunks.push(value);
+    }
+
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    return { kind: "ok", value: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) };
+  } catch {
+    return { kind: "invalid" };
+  }
 }

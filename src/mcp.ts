@@ -1,5 +1,5 @@
 import type { AuthInfo, CallToolResult } from "@modelcontextprotocol/server";
-import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import type { RuntimeConfig } from "./config.ts";
 import { isTrustedHost, isTrustedOrigin, json, withCors } from "./http.ts";
@@ -50,6 +50,43 @@ type FetchVitalsOutput = z.infer<typeof fetchVitalsOutputSchema>;
 type ScanOutput = z.infer<typeof scanOutputSchema>;
 
 export function createMcpEndpoint(config: RuntimeConfig): McpEndpoint {
+  const handler = createMcpHandler(() => createMedlockMcpServer(config), {
+    onerror: (error) => console.error("mcp request failed", error.name),
+  });
+
+  return {
+    async handle(request: Request): Promise<Response> {
+      if (!isTrustedHost(request, config)) {
+        return withCors(json({ error: "untrusted host" }, { status: 403 }), request, config);
+      }
+
+      if (!isTrustedOrigin(request, config)) {
+        return withCors(json({ error: "untrusted origin" }, { status: 403 }), request, config);
+      }
+
+      if (request.method === "OPTIONS") {
+        return withCors(new Response(null, { status: 204 }), request, config);
+      }
+
+      if (request.method !== "POST") {
+        return withCors(
+          json({ error: "method not allowed" }, { headers: { Allow: "POST, OPTIONS" }, status: 405 }),
+          request,
+          config,
+        );
+      }
+
+      const authInfo = authenticate(request, config);
+      if (!authInfo) {
+        return withCors(json({ error: "missing or invalid bearer token" }, { status: 401 }), request, config);
+      }
+
+      return withCors(await handler.fetch(request, { authInfo }), request, config);
+    },
+  };
+}
+
+function createMedlockMcpServer(config: RuntimeConfig): McpServer {
   const server = new McpServer(
     {
       name: "medlock",
@@ -63,34 +100,7 @@ export function createMcpEndpoint(config: RuntimeConfig): McpEndpoint {
   );
 
   registerMedlockTools(server, config);
-
-  const transport = new WebStandardStreamableHTTPServerTransport();
-  transport.onerror = (error) => console.error("mcp transport error", error);
-  const ready = server.connect(transport);
-
-  return {
-    async handle(request: Request): Promise<Response> {
-      if (request.method === "OPTIONS") {
-        return withCors(new Response(null, { status: 204 }), request, config);
-      }
-
-      if (!isTrustedHost(request, config)) {
-        return withCors(json({ error: "untrusted host" }, { status: 403 }), request, config);
-      }
-
-      if (!isTrustedOrigin(request, config)) {
-        return withCors(json({ error: "untrusted origin" }, { status: 403 }), request, config);
-      }
-
-      const authInfo = authenticate(request, config);
-      if (!authInfo) {
-        return withCors(json({ error: "missing or invalid bearer token" }, { status: 401 }), request, config);
-      }
-
-      await ready;
-      return withCors(await transport.handleRequest(request, { authInfo }), request, config);
-    },
-  };
+  return server;
 }
 
 function registerMedlockTools(server: McpServer, config: RuntimeConfig): void {
