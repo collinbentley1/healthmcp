@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   infrastructure:
-    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@v0.2.0
+    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@v0.3.1
     with:
       project-id: medlock-1025243085
       workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
