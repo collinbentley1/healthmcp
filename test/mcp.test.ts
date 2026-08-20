@@ -45,6 +45,31 @@ describe("mcp", () => {
     expect(result.structuredContent?.source).toBe("demo-solid-pod");
     expect(result.content[0]?.type).toBe("text");
 
+    const scanResult = (await client.callTool({
+      arguments: { device: "rear" },
+      name: "vitals_scan",
+    })) as CallToolResult;
+
+    const expectedScanResult = {
+      device: "rear",
+      instructions: [
+        "Open the scan URL in a trusted browser session.",
+        "Grant camera access only after the browser explains the local processing flow.",
+        "Keep your finger still over the camera lens until the quality indicator is stable.",
+      ],
+      privacyMode: "local-first",
+      scanUrl: "https://medlock.ai/scan?device=rear",
+      status: "ready",
+      supportedMeasurements: ["heart_rate", "blood_oxygen", "respiratory_rate"],
+    };
+
+    expect(scanResult.isError).not.toBe(true);
+    expect(scanResult.structuredContent).toEqual(expectedScanResult);
+    expect(scanResult.content[0]?.type).toBe("text");
+    if (scanResult.content[0]?.type === "text") {
+      expect(JSON.parse(scanResult.content[0].text)).toEqual(expectedScanResult);
+    }
+
     await client.close();
   });
 });
