@@ -26,6 +26,27 @@ describe("server", () => {
     expect(favicon.headers.get("Content-Type")).toBe("image/svg+xml");
   });
 
+  test("sends HSTS on page and redirect responses", async () => {
+    const handler = createHandler({ config });
+    const page = await handler(new Request("http://localhost/"));
+    const redirect = await handler(
+      new Request("https://healthmcp.ai/", {
+        headers: { Host: "healthmcp.ai" },
+      }),
+    );
+
+    expect(page.headers.get("Strict-Transport-Security")).toBe("max-age=31536000; includeSubDomains");
+    expect(redirect.headers.get("Strict-Transport-Security")).toBe("max-age=31536000; includeSubDomains");
+  });
+
+  test("serves the Open Graph image as PNG", async () => {
+    const handler = createHandler({ config });
+    const image = await handler(new Request("http://localhost/assets/og-image.png"));
+
+    expect(image.status).toBe(200);
+    expect(image.headers.get("Content-Type")).toBe("image/png");
+  });
+
   test("redirects legacy healthmcp host to canonical medlock.ai", async () => {
     const response = await createHandler({ config })(
       new Request("https://healthmcp.ai/path?x=1", {

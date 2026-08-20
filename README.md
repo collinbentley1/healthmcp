@@ -90,6 +90,8 @@ bun install
 bun run dev
 ```
 
+Medlock targets stable Bun 1.4. Run `bun upgrade --stable` to bring a local install up to date; the Docker image pins `bun-v1.4.0` exactly.
+
 Useful commands:
 
 ```sh

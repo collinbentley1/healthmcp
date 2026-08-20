@@ -5,11 +5,11 @@ const root = join(import.meta.dir, "..");
 const failures: string[] = [];
 
 await requireContains("Dockerfile", "dhi.io/bun", "Dockerfile must use Docker Hardened Bun images.");
-await requireContains("Dockerfile", "bun upgrade --canary", "Dockerfile must upgrade Bun to the latest canary.");
+await requireContains("Dockerfile", "bun-v1.4.0", "Dockerfile must pin Bun 1.4.0.");
 await requireContains("public/index.html", 'rel="icon"', "The document must link a favicon.");
 await requireContains("tools/build.ts", "scan.html", "The production build must include the scan handoff page.");
 await requireContains("src/mcp.ts", "WebStandardStreamableHTTPServerTransport", "MCP must use the web-standard Streamable HTTP transport.");
-await rejectContains("public/index.html", "https://", "The frontend should not load third-party assets.");
+await rejectExternalReferences("public/index.html", "https://medlock.ai/", "The frontend should not reference third-party assets.");
 await rejectContains("public/assets/styles.css", "@import", "Styles should not import third-party design libraries.");
 await rejectContains("src/client.ts", "react", "The frontend should stay framework-free.");
 await rejectContains("src/server.ts", "wrangler", "Cloudflare/Wrangler runtime code should not remain.");
@@ -32,6 +32,13 @@ async function requireContains(path: string, needle: string, message: string): P
 async function rejectContains(path: string, needle: string, message: string): Promise<void> {
   const text = await readFile(join(root, path), "utf8");
   if (text.includes(needle)) {
+    failures.push(`${path}: ${message}`);
+  }
+}
+
+async function rejectExternalReferences(path: string, sameOriginPrefix: string, message: string): Promise<void> {
+  const text = await readFile(join(root, path), "utf8");
+  if (text.replaceAll(sameOriginPrefix, "").includes("https://")) {
     failures.push(`${path}: ${message}`);
   }
 }
