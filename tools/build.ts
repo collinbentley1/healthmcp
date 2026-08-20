@@ -33,6 +33,7 @@ await Bun.write(join(distPublicDir, "index.html"), Bun.file(join(publicDir, "ind
 await Bun.write(join(distPublicDir, "scan.html"), Bun.file(join(publicDir, "scan.html")));
 await Bun.write(join(distPublicDir, "favicon.svg"), Bun.file(join(publicDir, "favicon.svg")));
 await Bun.write(join(distPublicDir, "assets", "styles.css"), Bun.file(join(publicDir, "assets", "styles.css")));
+await Bun.write(join(distPublicDir, "assets", "og-image.png"), Bun.file(join(publicDir, "assets", "og-image.png")));
 
 function assertBuild(result: Bun.BuildOutput, label: string): void {
   if (!result.success) {
