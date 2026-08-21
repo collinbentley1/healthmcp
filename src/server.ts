@@ -39,7 +39,8 @@ export function createHandler(
     const effectivePeerAddress = typeof peerAddress === "string" && peerAddress ? peerAddress : "unknown";
     const healthUrl = new URL(request.url);
     if (healthUrl.pathname === "/livez") {
-      return json({ ok: true });
+      const deployment = Bun.env.PLATFORM_DEPLOY_NONCE;
+      return json(deployment ? { ok: true, deployment } : { ok: true });
     }
 
     const canonicalRedirect = shouldRedirectToCanonical(request, config);

@@ -14,6 +14,8 @@ const config = getRuntimeConfig({
   PUBLIC_DIR: `${import.meta.dir}/../public`,
 });
 
+delete Bun.env.PLATFORM_DEPLOY_NONCE;
+
 describe("server", () => {
   test("serves static homepage and favicon", async () => {
     const handler = createHandler({ config });
@@ -32,6 +34,23 @@ describe("server", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
+  });
+
+  test("echoes the platform deployment nonce at /livez when configured", async () => {
+    Bun.env.PLATFORM_DEPLOY_NONCE = "test-deployment-nonce";
+
+    try {
+      const handler = createHandler({ config });
+      const response = await handler(new Request("http://localhost/livez"));
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        deployment: "test-deployment-nonce",
+        ok: true,
+      });
+    } finally {
+      delete Bun.env.PLATFORM_DEPLOY_NONCE;
+    }
   });
 
   test("sends HSTS on page and redirect responses", async () => {
