@@ -58,7 +58,7 @@ export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.e
     firestoreDatabaseId: env.FIRESTORE_DATABASE_ID ?? "(default)",
     firestoreProjectId: present(env.FIRESTORE_PROJECT_ID ?? env.GOOGLE_CLOUD_PROJECT),
     legacyHosts: parseList(env.LEGACY_HOSTS, DEFAULT_LEGACY_HOSTS),
-    mcpBearerToken: present(env.MEDLOCK_MCP_TOKEN),
+    mcpBearerToken: parseBearerToken(env.MEDLOCK_MCP_TOKEN),
     port: Number(env.PORT ?? 3000),
     publicDir: env.PUBLIC_DIR ?? (import.meta.dir.endsWith("/dist") ? BUILT_PUBLIC_DIR : SOURCE_PUBLIC_DIR),
     version: env.MEDLOCK_VERSION ?? "0.2.0",
@@ -87,7 +87,15 @@ export function normalizeOrigin(origin: string | null): string | undefined {
 
   try {
     const url = new URL(origin);
-    return `${url.protocol}//${url.host}`.toLowerCase();
+    const normalized = url.origin.toLowerCase();
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      origin.toLowerCase() !== normalized
+    ) {
+      return undefined;
+    }
+
+    return normalized;
   } catch {
     return undefined;
   }
@@ -107,6 +115,15 @@ function parseList(value: string | undefined, fallback: readonly string[]): stri
 function present(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function parseBearerToken(value: string | undefined): string | undefined {
+  const token = present(value);
+  if (token && new TextEncoder().encode(token).byteLength < 32) {
+    throw new Error("MEDLOCK_MCP_TOKEN must contain at least 32 bytes.");
+  }
+
+  return token;
 }
 
 function parseWaitlistBackend(value: string | undefined): RuntimeConfig["waitlistBackend"] {

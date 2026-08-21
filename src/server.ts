@@ -26,14 +26,17 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
   ".svg": "image/svg+xml",
 };
 
-export function createHandler(dependencies: ServerDependencies = {}): (request: Request) => Promise<Response> {
+export function createHandler(
+  dependencies: ServerDependencies = {},
+): (request: Request, peerAddress?: unknown) => Promise<Response> {
   const config = dependencies.config ?? getRuntimeConfig();
   const waitlistStore = dependencies.waitlistStore ?? createWaitlistStore(config);
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
 
-  return async function handleRequest(request: Request): Promise<Response> {
+  return async function handleRequest(request: Request, peerAddress?: unknown): Promise<Response> {
+    const effectivePeerAddress = typeof peerAddress === "string" && peerAddress ? peerAddress : "unknown";
     const healthUrl = new URL(request.url);
     if (healthUrl.pathname === "/livez") {
       return json({ ok: true });
@@ -48,7 +51,7 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
 
     try {
       if (url.pathname === "/api/waitlist") {
-        return handleWaitlist(request, config, waitlistStore, rateLimiter, now);
+        return await handleWaitlist(request, effectivePeerAddress, config, waitlistStore, rateLimiter, now);
       }
 
       if (url.pathname === "/api/mcp") {
@@ -56,10 +59,10 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
       }
 
       if (url.pathname === "/scan") {
-        return serveStatic("/scan.html", config);
+        return await serveStatic("/scan.html", config);
       }
 
-      return serveStatic(url.pathname, config);
+      return await serveStatic(url.pathname, config);
     } catch (error) {
       console.error("request failed", error instanceof Error ? error.name : "unknown error");
       return url.pathname.startsWith("/api/")
@@ -71,46 +74,61 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
 
 export const handleRequest = createHandler();
 
-if (import.meta.main) {
-  const config = getRuntimeConfig();
-  const server = Bun.serve({
-    fetch: createHandler({ config }),
+export function startServer(
+  config: RuntimeConfig = getRuntimeConfig(),
+  dependencies: Omit<ServerDependencies, "config"> = {},
+): ReturnType<typeof Bun.serve> {
+  const handler = createHandler({ ...dependencies, config });
+  return Bun.serve({
+    development: false,
+    error(error) {
+      console.error("server error", error instanceof Error ? error.name : "unknown error");
+      return json({ error: "internal server error" }, { status: 500 });
+    },
+    fetch(request, activeServer) {
+      return handler(request, activeServer.requestIP(request)?.address);
+    },
     hostname: "0.0.0.0",
     maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
     port: config.port,
   });
+}
+
+if (import.meta.main) {
+  const server = startServer();
 
   console.info(`medlock listening on ${server.url}`);
 }
 
 async function handleWaitlist(
   request: Request,
+  peerAddress: string,
   config: RuntimeConfig,
   store: WaitlistStore,
   rateLimiter: InMemoryRateLimiter,
   now: () => Date,
 ): Promise<Response> {
   if (request.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders(request, config), status: 204 });
+    return withSecurityHeaders(new Response(null, { headers: corsHeaders(request, config), status: 204 }));
   }
 
   if (request.method !== "POST") {
     return apiJson({ error: "method not allowed" }, request, config, { headers: { Allow: "POST, OPTIONS" }, status: 405 });
   }
 
-  const ipAddress = clientAddress(request);
-  const decision = rateLimiter.check(`waitlist:${ipAddress}`, 5, 60_000);
-  if (!decision.allowed) {
-    return apiJson(
-      { error: "too many waitlist attempts" },
-      request,
-      config,
-      { headers: { "Retry-After": String(decision.retryAfterSeconds ?? 60) }, status: 429 },
-    );
+  const globalDecision = rateLimiter.check("waitlist:global", 60, 60_000);
+  if (!globalDecision.allowed) {
+    return rateLimitedWaitlistResponse(request, config, globalDecision.retryAfterSeconds);
   }
 
-  const contentType = request.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
+  const ipAddress = peerAddress;
+  const decision = rateLimiter.check(`waitlist:${ipAddress}`, 5, 60_000);
+  if (!decision.allowed) {
+    return rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+  }
+
+  const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") {
     return apiJson({ error: "expected application/json" }, request, config, { status: 415 });
   }
 
@@ -143,14 +161,15 @@ async function handleWaitlist(
     return apiJson({ error: result.error }, request, config, { status: result.status });
   }
 
+  return apiJson({ ok: true }, request, config, { status: 202 });
+}
+
+function rateLimitedWaitlistResponse(request: Request, config: RuntimeConfig, retryAfterSeconds = 60): Response {
   return apiJson(
-    {
-      duplicate: result.duplicate,
-      ok: true,
-    },
+    { error: "too many waitlist attempts" },
     request,
     config,
-    { status: result.duplicate ? 200 : 201 },
+    { headers: { "Retry-After": String(retryAfterSeconds) }, status: 429 },
   );
 }
 
@@ -170,7 +189,12 @@ function apiJson(body: unknown, request: Request, config: RuntimeConfig, options
 }
 
 async function serveStatic(pathname: string, config: RuntimeConfig): Promise<Response> {
-  const pathnameWithoutSlash = pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1));
+  let pathnameWithoutSlash: string;
+  try {
+    pathnameWithoutSlash = pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1));
+  } catch {
+    return text("bad request", { status: 400 });
+  }
   const requestedPath = pathnameWithoutSlash === "favicon.ico" ? "favicon.svg" : pathnameWithoutSlash;
   const normalizedPath = normalize(requestedPath);
 
@@ -198,11 +222,6 @@ async function serveStatic(pathname: string, config: RuntimeConfig): Promise<Res
       },
     }),
   );
-}
-
-function clientAddress(request: Request): string {
-  const forwardedFor = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  return forwardedFor || request.headers.get("x-real-ip") || request.headers.get("cf-connecting-ip") || "unknown";
 }
 
 type BoundedJsonResult =

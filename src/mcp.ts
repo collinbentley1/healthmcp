@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { AuthInfo, CallToolResult } from "@modelcontextprotocol/server";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
@@ -94,7 +95,7 @@ export function createMcpEndpoint(config: RuntimeConfig): McpEndpoint {
         );
       }
 
-      const parsedBody = await readBoundedJson(request.clone(), MAX_MCP_BODY_SIZE);
+      const parsedBody = await readBoundedJson(request, MAX_MCP_BODY_SIZE);
       if (parsedBody.kind === "too-large") {
         return withCors(json({ error: "request body too large" }, { status: 413 }), request, config);
       }
@@ -246,10 +247,10 @@ function authenticate(request: Request, config: RuntimeConfig): AuthInfo | undef
     };
   }
 
-  const authorization = request.headers.get("authorization")?.trim();
-  const expected = `Bearer ${config.mcpBearerToken}`;
+  const authorization = request.headers.get("authorization")?.trim() ?? "";
+  const suppliedToken = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
 
-  if (authorization !== expected) {
+  if (!tokensEqual(suppliedToken, config.mcpBearerToken)) {
     return undefined;
   }
 
@@ -258,6 +259,12 @@ function authenticate(request: Request, config: RuntimeConfig): AuthInfo | undef
     scopes: ["pod:read", "scan:prepare"],
     token: config.mcpBearerToken,
   };
+}
+
+function tokensEqual(left: string, right: string): boolean {
+  const leftHash = createHash("sha256").update(left).digest();
+  const rightHash = createHash("sha256").update(right).digest();
+  return timingSafeEqual(leftHash, rightHash);
 }
 
 type BoundedJsonResult =

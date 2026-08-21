@@ -98,6 +98,24 @@ describe("initialize probe", () => {
     expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
   });
 
+  test("rejects opaque and malformed Origin headers instead of treating them as absent", async () => {
+    for (const origin of [
+      "null",
+      "://malformed",
+      "https://claude.ai/",
+      "https://claude.ai/path",
+      "https://user@claude.ai",
+      "https://claude.ai?query",
+      "https://claude.ai#fragment",
+    ]) {
+      const response = await initialize(serve(), { Origin: origin });
+
+      expect(response.status, origin).toBe(403);
+      expect(response.headers.get("Access-Control-Allow-Origin"), origin).toBeNull();
+      expect(response.headers.get("X-Content-Type-Options"), origin).toBe("nosniff");
+    }
+  });
+
   test("echoes an allow-listed origin in CORS headers", async () => {
     const response = await initialize(serve(), { Origin: "https://claude.ai" });
 
@@ -107,12 +125,29 @@ describe("initialize probe", () => {
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
-  test("rejects DELETE without affecting the next POST", async () => {
-    const endpoint = serve();
-    const deleted = await fetch(endpoint, { method: "DELETE" });
+  test("normalizes case but does not let wildcard origins change ports", async () => {
+    const normalized = await initialize(serve(), { Origin: "HTTPS://CLAUDE.AI" });
+    expect(normalized.status).toBe(200);
+    expect(normalized.headers.get("Access-Control-Allow-Origin")).toBe("https://claude.ai");
 
-    expect(deleted.status).toBe(405);
-    expect(deleted.headers.get("Allow")).toBe("POST, OPTIONS");
+    const endpoint = serve({ ALLOWED_ORIGINS: "https://*.run.app" });
+    const allowed = await initialize(endpoint, { Origin: "https://example.run.app" });
+    const wrongPort = await initialize(endpoint, { Origin: "https://example.run.app:444" });
+
+    expect(allowed.status).toBe(200);
+    expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe("https://example.run.app");
+    expect(wrongPort.status).toBe(403);
+    expect(wrongPort.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  test("rejects every unsupported method without affecting the next POST", async () => {
+    const endpoint = serve();
+
+    for (const method of ["GET", "DELETE", "PUT", "PATCH"]) {
+      const rejected = await fetch(endpoint, { method });
+      expect(rejected.status, method).toBe(405);
+      expect(rejected.headers.get("Allow"), method).toBe("POST, OPTIONS");
+    }
 
     const initialized = await initialize(endpoint);
     expect(initialized.status).toBe(200);
@@ -120,7 +155,8 @@ describe("initialize probe", () => {
   });
 
   test("requires the bearer token when MEDLOCK_MCP_TOKEN is configured", async () => {
-    const endpoint = serve({ MEDLOCK_MCP_TOKEN: "probe-secret" });
+    const token = "probe-".repeat(6);
+    const endpoint = serve({ MEDLOCK_MCP_TOKEN: token });
 
     const missing = await initialize(endpoint);
     expect(missing.status).toBe(401);
@@ -129,9 +165,13 @@ describe("initialize probe", () => {
     const wrong = await initialize(endpoint, { Authorization: "Bearer wrong" });
     expect(wrong.status).toBe(401);
 
-    const authorized = await initialize(endpoint, { Authorization: "Bearer probe-secret" });
+    const authorized = await initialize(endpoint, { Authorization: `Bearer ${token}` });
     expect(authorized.status).toBe(200);
     expect(parseSseMessage(await authorized.text()).event).toBe("message");
+  });
+
+  test("rejects weak private-deployment bearer tokens during configuration", () => {
+    expect(() => getRuntimeConfig({ MEDLOCK_MCP_TOKEN: "too-short" })).toThrow("at least 32 bytes");
   });
 
   test("rejects JSON-RPC batches and oversized MCP bodies", async () => {

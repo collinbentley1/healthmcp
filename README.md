@@ -52,7 +52,7 @@ Each claim below cites the file that implements it.
 - **Single request handler.** `src/server.ts` routes `/api/mcp` to the MCP transport, `/api/waitlist` to the waitlist store, and everything else to static assets, with canonical-host 308 redirects for legacy domains (`src/http.ts`, `src/config.ts`).
 - **Bearer auth for private deployments.** When `MEDLOCK_MCP_TOKEN` is set, MCP requests without the matching `Authorization: Bearer` header get 401 (`authenticate()` in `src/mcp.ts`; `src/config.ts`). Without a token, requests run as an anonymous demo client with `demo:read` scope. The `medlock://context` resource states the rule: connect real Solid Pods only through a private deployment with the token configured (`src/mcp.ts`).
 - **Origin and host allow-listing.** MCP requests from origins outside the allow-list get 403; the same applies to unrecognized `Host` values (`isTrustedOrigin`/`isTrustedHost` in `src/http.ts`, enforced in `src/mcp.ts`; defaults, including `https://claude.ai` and `https://chat.openai.com`, in `src/config.ts`). CORS headers echo only allow-listed origins.
-- **Rate limiting.** An in-memory limiter (`src/rate-limit.ts`) caps the waitlist API at 5 requests per minute per client IP (`handleWaitlist()` in `src/server.ts`). The MCP endpoint itself is not rate-limited in application code.
+- **Rate limiting.** A bounded in-memory limiter (`src/rate-limit.ts`) caps the waitlist API at 5 requests per minute per server-observed peer and 60 requests per minute per instance (`handleWaitlist()` in `src/server.ts`). Forwarding headers supplied by callers are not trusted. The MCP endpoint itself is not rate-limited in application code.
 - **Response headers.** Site pages and API responses carry a CSP with `default-src 'self'` and no `unsafe-inline`, `frame-ancestors 'none'`, COOP/CORP `same-origin`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a Permissions-Policy disabling camera, geolocation, microphone, and payment (`SECURITY_HEADERS` in `src/http.ts`). API CORS advertises only POST and OPTIONS and echoes only allow-listed origins.
 - **Request body limits.** Bun rejects request bodies larger than 1 MiB, MCP reads at most 64 KiB and rejects JSON-RPC batches, and the waitlist route reads at most 8 KiB before parsing JSON (`src/mcp.ts`, `src/server.ts`).
 - **Honest demo data.** Deterministic sample vitals (`src/vitals.ts`) with the disclosure wired through the protocol surface as described above (`src/mcp.ts`).
@@ -99,7 +99,6 @@ Useful commands:
 bun run test
 bun run typecheck
 bun run verify
-bun run mcp:inspect
 ```
 
 The MCP endpoint is available at:
@@ -128,7 +127,7 @@ Environment variables:
 - `FIRESTORE_DATABASE_ID`: Firestore database ID, default `(default)`
 - `FIRESTORE_PROJECT_ID`: project used by the Firestore REST API; Cloud Run also sets `GOOGLE_CLOUD_PROJECT`
 - `LEGACY_HOSTS`: comma-separated hosts redirected to `CANONICAL_HOST`
-- `MEDLOCK_MCP_TOKEN`: optional bearer token for private MCP deployments
+- `MEDLOCK_MCP_TOKEN`: optional bearer token for private MCP deployments; when set, it must contain at least 32 random bytes
 - `PORT`: HTTP port, default `3000`
 - `PUBLIC_DIR`: static asset directory override
 - `WAITLIST_BACKEND`: `file`, `memory`, or `firestore`; production uses `firestore`, pull request previews use `memory`

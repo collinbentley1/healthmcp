@@ -112,8 +112,13 @@ export function isTrustedHost(request: Request, config: RuntimeConfig): boolean 
 }
 
 export function isTrustedOrigin(request: Request, config: RuntimeConfig): boolean {
-  const origin = normalizeOrigin(request.headers.get("origin"));
-  return !origin || matchesOrigin(origin, config.allowedOrigins);
+  const originHeader = request.headers.get("origin");
+  if (originHeader === null) {
+    return true;
+  }
+
+  const origin = normalizeOrigin(originHeader);
+  return origin !== undefined && matchesOrigin(origin, config.allowedOrigins);
 }
 
 function matchesHost(host: string, patterns: readonly string[]): boolean {
@@ -137,7 +142,11 @@ function matchesOrigin(origin: string, patterns: readonly string[]): boolean {
   return patterns.some((pattern) => {
     if (pattern.includes("*.")) {
       const patternUrl = new URL(pattern.replace("*.", "wildcard."));
-      return parsed.protocol === patternUrl.protocol && matchesHost(parsed.hostname, [patternUrl.hostname.replace("wildcard.", "*.")]);
+      return (
+        parsed.protocol === patternUrl.protocol &&
+        parsed.port === patternUrl.port &&
+        matchesHost(parsed.hostname, [patternUrl.hostname.replace("wildcard.", "*.")])
+      );
     }
 
     return origin === pattern;

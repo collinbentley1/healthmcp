@@ -18,7 +18,6 @@
     "lint": "bun run tools/lint.ts",
     "format": "bun run tools/format.ts --write",
     "format:check": "bun run tools/format.ts",
-    "mcp:inspect": "bunx mcp-inspector http://localhost:3000/api/mcp",
     "hooks:install": "git config core.hooksPath .githooks",
     "verify": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build",
     "verify:ci": "bun run --parallel lint typecheck test build"
@@ -30,9 +29,8 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.0.0",
-    "@modelcontextprotocol/inspector": "2.3.0",
     "@socketsecurity/bun-security-scanner": "1.1.2",
-    "@types/bun": "1.3.14",
+    "@types/bun": "1.4.0",
     "typescript": "7.0.2"
   }
 }

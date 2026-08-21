@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { getRuntimeConfig } from "../src/config.ts";
-import { createHandler } from "../src/server.ts";
-import { MemoryWaitlistStore } from "../src/waitlist.ts";
+import { createHandler, startServer } from "../src/server.ts";
+import { MemoryWaitlistStore, type WaitlistStore } from "../src/waitlist.ts";
 
 const config = getRuntimeConfig({
   ALLOWED_HOSTS: "localhost,127.0.0.1,healthmcp.ai,www.medlock.ai,medlock.ai",
@@ -55,6 +55,15 @@ describe("server", () => {
     expect(image.headers.get("Content-Type")).toBe("image/png");
   });
 
+  test("rejects malformed percent-encoded paths inside the hardened response boundary", async () => {
+    const response = await createHandler({ config })(new Request("http://localhost/%E0%A4%A"));
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("bad request");
+    expect(response.headers.get("Strict-Transport-Security")).toContain("max-age=");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+  });
+
   test("redirects legacy healthmcp host to canonical medlock.ai", async () => {
     const response = await createHandler({ config })(
       new Request("https://healthmcp.ai/path?x=1", {
@@ -66,26 +75,89 @@ describe("server", () => {
     expect(response.headers.get("Location")).toBe("https://medlock.ai/path?x=1");
   });
 
-  test("accepts waitlist JSON and rate limits repeated attempts", async () => {
+  test("accepts waitlist JSON and ignores spoofed forwarding headers when rate limiting", async () => {
     const handler = createHandler({ config, waitlistStore: new MemoryWaitlistStore() });
+    let requestIndex = 0;
     const request = () =>
       new Request("http://localhost/api/waitlist", {
         body: JSON.stringify({ email: "person@example.com" }),
         headers: {
           "Content-Type": "application/json",
-          "X-Forwarded-For": "203.0.113.22",
+          "X-Forwarded-For": `203.0.113.${requestIndex++}`,
         },
         method: "POST",
       });
 
-    const response = await handler(request());
-    expect(response.status).toBe(201);
+    const response = await handler(request(), "192.0.2.10");
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ ok: true });
 
     for (let index = 0; index < 4; index += 1) {
-      expect((await handler(request())).status).toBe(200);
+      const duplicate = await handler(request(), "192.0.2.10");
+      expect(duplicate.status).toBe(202);
+      expect(await duplicate.json()).toEqual({ ok: true });
     }
 
-    expect((await handler(request())).status).toBe(429);
+    expect((await handler(request(), "192.0.2.10")).status).toBe(429);
+  });
+
+  test("uses Bun's socket peer in the production server adapter", async () => {
+    const server = startServer({ ...config, port: 0 }, { waitlistStore: new MemoryWaitlistStore() });
+
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        const response = await fetch(new URL("/api/waitlist", server.url), {
+          body: JSON.stringify({ email: "person@example.com" }),
+          headers: {
+            "Content-Type": "application/json",
+            "X-Forwarded-For": `203.0.113.${index}`,
+          },
+          method: "POST",
+        });
+        expect(response.status).toBe(202);
+      }
+
+      const limited = await fetch(new URL("/api/waitlist", server.url), {
+        body: JSON.stringify({ email: "person@example.com" }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-Forwarded-For": "198.51.100.200",
+        },
+        method: "POST",
+      });
+      expect(limited.status).toBe(429);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("caps aggregate waitlist traffic even when peer buckets differ", async () => {
+    const handler = createHandler({ config, waitlistStore: new MemoryWaitlistStore() });
+    const request = () =>
+      new Request("http://localhost/api/waitlist", {
+        body: JSON.stringify({ email: "person@example.com" }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+
+    for (let index = 0; index < 60; index += 1) {
+      expect((await handler(request(), `192.0.2.${index}`)).status).toBe(202);
+    }
+    expect((await handler(request(), "198.51.100.1")).status).toBe(429);
+  });
+
+  test("applies the hardened response boundary to waitlist preflights", async () => {
+    const response = await createHandler({ config })(
+      new Request("http://localhost/api/waitlist", {
+        headers: { Origin: "http://localhost:3000" },
+        method: "OPTIONS",
+      }),
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3000");
+    expect(response.headers.get("Strict-Transport-Security")).toContain("max-age=");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
   test("rejects an oversized waitlist body before parsing or persistence", async () => {
@@ -100,6 +172,41 @@ describe("server", () => {
 
     expect(response.status).toBe(413);
     expect(await response.json()).toEqual({ error: "request body too large" });
+  });
+
+  test("rejects CORS-safelisted content types that merely contain application/json", async () => {
+    const response = await createHandler({ config, waitlistStore: new MemoryWaitlistStore() })(
+      new Request("http://localhost/api/waitlist", {
+        body: JSON.stringify({ email: "person@example.com" }),
+        headers: { "Content-Type": "text/plain; x=application/json", Origin: "https://attacker.example" },
+        method: "POST",
+      }),
+    );
+
+    expect(response.status).toBe(415);
+    expect(await response.json()).toEqual({ error: "expected application/json" });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  test("keeps waitlist store failures inside the hardened API boundary", async () => {
+    const throwingStore: WaitlistStore = {
+      get: () => Promise.reject(new Error("private waitlist marker")),
+      put: () => Promise.reject(new Error("private waitlist marker")),
+    };
+    const response = await createHandler({ config, waitlistStore: throwingStore })(
+      new Request("http://localhost/api/waitlist", {
+        body: JSON.stringify({ email: "person@example.com" }),
+        headers: { "Content-Type": "application/json", Origin: "http://localhost:3000" },
+        method: "POST",
+      }),
+    );
+    const body = await response.text();
+
+    expect(response.status).toBe(500);
+    expect(body).toBe('{"error":"internal server error"}');
+    expect(body).not.toContain("private waitlist marker");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3000");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
   test("does not expose thrown error details in API responses", async () => {
