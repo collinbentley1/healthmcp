@@ -17,10 +17,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "bun run tools/lint.ts",
     "format": "bun run tools/format.ts --write",
-    "format:check": "bun run tools/format.ts",
+    "format:check": "bun run tools/format.ts --check",
     "hooks:install": "git config core.hooksPath .githooks",
-    "verify": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build",
-    "verify:ci": "bun run --parallel lint typecheck test build"
+    "verify": "bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci",
+    "verify:ci": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {
     "@cfworker/json-schema": "4.1.1",

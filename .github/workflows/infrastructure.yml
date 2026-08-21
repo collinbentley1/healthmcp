@@ -2,19 +2,11 @@ name: Infrastructure
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
   infrastructure:
-    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@v0.4.0
-    with:
-      project-id: medlock-1025243085
-      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      terraform-service-account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+    permissions:
+      contents: read
+    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@823466fd2920a1539f5337409c6b59da34700e8d

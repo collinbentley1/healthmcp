@@ -125,7 +125,9 @@ Environment variables:
 - `DATA_DIR`: local filesystem storage for development waitlist entries when `WAITLIST_BACKEND=file`
 - `FIRESTORE_COLLECTION`: Firestore collection for waitlist records, default `waitlist`
 - `FIRESTORE_DATABASE_ID`: Firestore database ID, default `(default)`
-- `FIRESTORE_PROJECT_ID`: project used by the Firestore REST API; Cloud Run also sets `GOOGLE_CLOUD_PROJECT`
+- `FIRESTORE_PROJECT_ID`: project used by the Firestore REST API; production
+  deployment injects the exact reviewed project ID from the immutable platform
+  map and does not rely on an ambient `GOOGLE_CLOUD_PROJECT` value
 - `LEGACY_HOSTS`: comma-separated hosts redirected to `CANONICAL_HOST`
 - `MEDLOCK_MCP_TOKEN`: optional bearer token for private MCP deployments; when set, it must contain at least 32 random bytes
 - `PORT`: HTTP port, default `3000`
@@ -134,21 +136,25 @@ Environment variables:
 
 ## Cloud Run Setup
 
-The repo follows the same shape as `collinbentley1/cdbentley`:
+The repository follows the shared platform contract:
 
-- `infra/terraform/bootstrap`: project services, Terraform state bucket, GitHub OIDC, and service accounts
-- `infra/terraform/prod`: Artifact Registry, Firestore, Cloud Run, and custom domain mappings
+- `infra/terraform/bootstrap` and `infra/terraform/prod`: validation/documentation mirrors only; they are not an apply surface
 - `.github/workflows/application.yml`: Bun verification
-- `.github/workflows/infrastructure.yml`: Terraform validation and production apply
+- `.github/workflows/infrastructure.yml`: Terraform validation and read-only convergence checks
 - `.github/workflows/deploy-prod.yml`: main branch container deployment
-- `.github/workflows/deploy-preview.yml`: pull request preview deployments
+- `.github/workflows/deploy-preview.yml`: tagged pull request traffic on the single no-data `medlock-preview` service
+- `.github/workflows/reconcile-previews.yml`: exact-revision cleanup and reconciliation for shared preview traffic
 
-Production expects the GitHub repository variables emitted by bootstrap outputs:
+Every caller and Terraform mirror pins the same reviewed full platform SHA. Authenticated infrastructure work checks out only that platform commit and selects the immutable platform-owned deployment configuration by numeric GitHub repository ID; it never executes consumer HCL. Bootstrap, production, and public-exposure changes must run through the owner-controlled, review-gated pipeline against `platform/terraform/deployments`, not a manual apply from this repository. Until that pipeline and its state migration are complete, consumer Actions stay disabled. See the [pinned security rollout](https://github.com/collinbentley1/platform/blob/823466fd2920a1539f5337409c6b59da34700e8d/docs/security-rollout.md).
 
-- `GCP_WORKLOAD_IDENTITY_PROVIDER`
-- `GCP_TERRAFORM_SERVICE_ACCOUNT`
-- `GCP_PROD_DEPLOY_SERVICE_ACCOUNT`
-- `GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT`
-- `GCP_RUNTIME_SERVICE_ACCOUNT`
+Do not define `GCP_*` repository variables or repository-level deploy secrets.
+Rotated `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, and `GRYPE_DB_MANIFEST_JSON` belong
+only to the owner-approved `preview-build` and `production-build` environments.
+The least-scope `SOCKET_API_TOKEN` is installed separately in `dependency-scan`
+and in both build environments because each performs an authenticated dependency
+install. Publish, cloud-deploy, preview-operations, and supply-chain environments
+are otherwise secretless for Medlock. Runtime configuration, including the
+production Firestore backend and memory-only preview mode, is selected in
+reviewed platform code rather than repository variables.
 
-The Dockerfile uses Docker Hardened Images, so repository secrets `DHI_USERNAME` and `DHI_ACCESS_TOKEN` are also required for GitHub Actions deploy jobs.
+Build, Artifact Registry publication, Cloud Run deployment, preview operations, and supply-chain attestation use separate protected environments and least-scope identities. External-fork and Dependabot pull requests receive neither those environment secrets nor a cloud preview.
