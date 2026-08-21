@@ -1,5 +1,5 @@
 module "bootstrap" {
-  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=823466fd2920a1539f5337409c6b59da34700e8d"
+  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=95ad7531492cba2891ec6d02fa2d821955cd36bc"
 
   app                         = "medlock"
   project_id                  = var.project_id
@@ -12,7 +12,7 @@ module "bootstrap" {
   github_owner_id             = var.github_owner_id
   github_repository_id        = var.github_repository_id
   trusted_platform_workflow_shas = [
-    "823466fd2920a1539f5337409c6b59da34700e8d",
+    "95ad7531492cba2891ec6d02fa2d821955cd36bc",
   ]
   required_services = [
     "artifactregistry.googleapis.com",
@@ -29,6 +29,7 @@ module "bootstrap" {
   runtime_project_roles = [
     "roles/datastore.user",
   ]
-  legacy_compatibility_mode = false
-  runtime_description       = "Runtime identity for the Medlock Cloud Run services."
+  legacy_compatibility_mode                              = false
+  manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy
+  runtime_description                                    = "Runtime identity for the Medlock Cloud Run services."
 }

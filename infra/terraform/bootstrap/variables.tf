@@ -66,3 +66,8 @@ variable "github_repository_id" {
     error_message = "github_repository_id must be a positive decimal ID."
   }
 }
+
+variable "manage_automatic_default_service_account_grants_policy" {
+  description = "Explicit protected-pipeline decision: true only when the project has an organization parent and the bootstrap identity has organization-level policy authority; false only for a reviewed standalone-project exception."
+  type        = bool
+}
