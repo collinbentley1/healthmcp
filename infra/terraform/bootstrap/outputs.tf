@@ -34,7 +34,7 @@ output "preview_deploy_service_account_email" {
 }
 
 output "preview_operator_service_account_email" {
-  description = "Cloud Run traffic-only service account used by preview cleanup and reconciliation jobs."
+  description = "Preview traffic-reconciliation service account with downloadArtifacts-only access to the exact preview repository."
   value       = module.bootstrap.preview_operator_service_account_email
 }
 

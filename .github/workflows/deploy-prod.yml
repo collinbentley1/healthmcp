@@ -12,7 +12,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # Prove exact-SHA WIF and read cloud metadata for convergence only.
-    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@d344f3835ca48f56c30a53641db8f3ea3a88ce53
+    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@37bd4c1b89481dbfbf1ed558ebc40f0c120f1755
 
   deploy:
     needs: infrastructure
@@ -22,7 +22,7 @@ jobs:
       contents: read
       id-token: write # Exchange only through exact production publish and deploy paths.
       packages: write # Publish and remove only the isolated GHCR staging image.
-    uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@d344f3835ca48f56c30a53641db8f3ea3a88ce53
+    uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@37bd4c1b89481dbfbf1ed558ebc40f0c120f1755
     secrets:
       DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}
       DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
