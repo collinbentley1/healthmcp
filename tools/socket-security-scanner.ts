@@ -1,15 +1,11 @@
-// Canonical dependency-free adapter for Socket's documented org-scoped PURL API.
-// Keep this byte-identical to the app template; the protected token is exposed
-// only after the platform contract proves that the consumer copy is unchanged.
-const socketOrganization = "collinbentley1";
-const socketApiBase = "https://api.socket.dev/v0";
+// Canonical dependency-free adapter for Socket's public PURL API.
+// Keep this byte-identical to the app template. Organization policy is enforced
+// independently by required checks from the installed Socket GitHub App.
 const socketFirewallBase = "https://firewall-api.socket.dev/purl";
-const authenticatedPackageLimit = 128;
-const authenticatedBatchCost = 100;
+const reviewedPackageLimit = 128;
 const publicConcurrency = 10;
 const requestTimeoutMs = 30_000;
 const maxResponseBytes = 10 * 1024 * 1024;
-const maxQuotaResponseBytes = 64 * 1024;
 const maxAlertsPerArtifact = 256;
 const maxAlertTextLength = 4_096;
 const userAgent = "collinbentley-platform-bun-scanner/1.0";
@@ -21,7 +17,6 @@ type SocketScannerOptions = {
   readonly fetcher?: Fetcher;
   readonly logger?: Logger;
   readonly timeoutMs?: number;
-  readonly token?: string | null;
 };
 
 type SocketArtifact = {
@@ -39,9 +34,9 @@ export function createSocketScanner(options: SocketScannerOptions = {}): Bun.Sec
   return {
     version: "1",
     async scan({ packages }) {
-      if (packages.length > authenticatedPackageLimit) {
+      if (packages.length > reviewedPackageLimit) {
         throw new Error(
-          `Socket Security Scanner: refusing to scan ${packages.length} packages; the reviewed limit is ${authenticatedPackageLimit}`,
+          `Socket Security Scanner: refusing to scan ${packages.length} packages; the reviewed limit is ${reviewedPackageLimit}`,
         );
       }
 
@@ -50,13 +45,7 @@ export function createSocketScanner(options: SocketScannerOptions = {}): Bun.Sec
         return [];
       }
 
-      const configuredToken =
-        options.token === undefined ? Bun.env.SOCKET_API_TOKEN : options.token;
-      const artifacts =
-        configuredToken === undefined || configuredToken === null
-          ? await scanPublic(purls, fetcher, logger, timeoutMs)
-          : await scanAuthenticated(purls, normalizeToken(configuredToken), fetcher, timeoutMs);
-
+      const artifacts = await scanPublic(purls, fetcher, logger, timeoutMs);
       return artifacts.flatMap(artifactToAdvisories);
     },
   };
@@ -84,99 +73,13 @@ function packagePurls(packages: readonly Bun.Security.Package[]): string[] {
   return [...purls];
 }
 
-function normalizeToken(token: string): string {
-  const normalized = token.trim();
-  if (
-    normalized.length === 0 ||
-    normalized.length > 1024 ||
-    /[\u0000-\u001f\u007f]/.test(normalized)
-  ) {
-    throw new Error("Socket Security Scanner: SOCKET_API_TOKEN is invalid");
-  }
-  return normalized;
-}
-
-async function scanAuthenticated(
-  purls: readonly string[],
-  token: string,
-  fetcher: Fetcher,
-  timeoutMs: number,
-): Promise<SocketArtifact[]> {
-  await requireQuota(fetcher, token, timeoutMs);
-
-  const query = new URLSearchParams({
-    alerts: "true",
-    actions: "error,warn",
-    poll: "true",
-    purlErrors: "true",
-    summary: "true",
-    timeoutSec: "25",
-  });
-  const text = await requestText(
-    fetcher,
-    `${socketApiBase}/orgs/${encodeURIComponent(socketOrganization)}/purl?${query}`,
-    {
-      method: "POST",
-      headers: {
-        Accept: "application/x-ndjson",
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "User-Agent": userAgent,
-      },
-      body: JSON.stringify({ components: purls.map((purl) => ({ purl })) }),
-    },
-    maxResponseBytes,
-    "authenticated package policy request",
-    timeoutMs,
-  );
-  return parseCompleteArtifacts(text, purls, true);
-}
-
-async function requireQuota(fetcher: Fetcher, token: string, timeoutMs: number): Promise<void> {
-  const text = await requestText(
-    fetcher,
-    `${socketApiBase}/quota`,
-    {
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${token}`,
-        "User-Agent": userAgent,
-      },
-    },
-    maxQuotaResponseBytes,
-    "quota preflight",
-    timeoutMs,
-  );
-  let quota: unknown;
-  try {
-    quota = JSON.parse(text);
-  } catch {
-    throw new Error("Socket Security Scanner: quota preflight returned invalid JSON");
-  }
-  if (
-    !isRecord(quota) ||
-    !isNonNegativeInteger(quota.quota) ||
-    !isNonNegativeInteger(quota.maxQuota) ||
-    quota.quota > quota.maxQuota ||
-    (quota.nextWindowRefresh !== null && validTimestamp(quota.nextWindowRefresh) === undefined)
-  ) {
-    throw new Error("Socket Security Scanner: quota preflight returned an invalid response");
-  }
-  if (quota.quota < authenticatedBatchCost) {
-    const refresh = validTimestamp(quota.nextWindowRefresh);
-    throw new Error(
-      `Socket Security Scanner: quota preflight requires ${authenticatedBatchCost} units but only ${quota.quota} remain${refresh ? `; next refresh ${refresh}` : ""}`,
-    );
-  }
-}
-
 async function scanPublic(
   purls: readonly string[],
   fetcher: Fetcher,
   logger: Logger,
   timeoutMs: number,
 ): Promise<SocketArtifact[]> {
-  logger("Socket Security Scanner free mode. Set SOCKET_API_TOKEN to use the organization policy.");
+  logger("Socket Security Scanner free mode.");
   const artifacts: SocketArtifact[] = [];
   for (const batch of chunk(purls, publicConcurrency)) {
     const responses = await Promise.all(

@@ -142,7 +142,7 @@ Environment variables:
 - `PORT`: HTTP port, default `3000`
 - `PUBLIC_DIR`: static asset directory override
 - `WAITLIST_BACKEND`: `file`, `memory`, or `firestore`; production uses `firestore`, pull request previews use `memory`
-- `WAITLIST_IDENTITY_KEYSET`: one unpadded base64url-encoded 32-byte signing key; deployed services require it. During production rotation, configure `new,old` so old cookies are accepted and immediately re-signed with `new`. After the 30-day cookie lifetime has elapsed, remove `old`. Production sources this value only from its protected GitHub deploy environment; the trusted platform deploy reuses the current exact Secret Manager version when the keyset is unchanged, otherwise streams it into a new version, and binds Cloud Run to that numeric version. The platform generates a revision-local preview value during each trusted deploy.
+- `WAITLIST_IDENTITY_KEYSET`: one unpadded base64url-encoded 32-byte signing key; deployed services require it. During local or private-deployment rotation, configure `new,old` so old cookies are accepted and immediately re-signed with `new`. After the 30-day cookie lifetime has elapsed, remove `old`. Production never sources this value from GitHub. The trusted platform deploy reuses the one exact numeric Secret Manager version already bound to Cloud Run or, only when both the binding and enabled-version inventory are empty, generates a key and streams it directly into a new version before binding that numeric version. The platform generates a revision-local preview value during each trusted deploy.
 
 ## Cloud Run Setup
 
@@ -155,18 +155,22 @@ The repository follows the shared platform contract:
 - `.github/workflows/deploy-preview.yml`: tagged pull request traffic on the single no-data `medlock-preview` service
 - `.github/workflows/reconcile-previews.yml`: exact-revision cleanup and reconciliation for shared preview traffic
 
-Every caller and Terraform mirror pins the same reviewed full platform SHA. Authenticated infrastructure work checks out only that platform commit and selects the immutable platform-owned deployment configuration by numeric GitHub repository ID; it never executes consumer HCL. Bootstrap, production, and public-exposure changes must run through the owner-controlled, review-gated pipeline against `platform/terraform/deployments`, not a manual apply from this repository. Actions may be enabled only after that pipeline, its state migration, exact-SHA WIF, and SHA-only enforcement are verified. See the [pinned security rollout](https://github.com/collinbentley1/platform/blob/161ac5c7541073efe974499b67aaa607b8b77ee1/docs/security-rollout.md).
+Every caller and Terraform mirror pins the same reviewed full platform SHA. Authenticated infrastructure work checks out only that platform commit and selects the immutable platform-owned deployment configuration by numeric GitHub repository ID; it never executes consumer HCL. Bootstrap, production, and public-exposure changes must run through the owner-controlled, review-gated pipeline against `platform/terraform/deployments`, not a manual apply from this repository. Actions may be enabled only after that pipeline, its state migration, exact-SHA WIF, and SHA-only enforcement are verified. See the [pinned security rollout](https://github.com/collinbentley1/platform/blob/ddaa918319be123c780876d510efb4715c1f879d/docs/security-rollout.md).
 
 Do not define `GCP_*` repository variables or repository-level deploy secrets.
-Rotated `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, `GRYPE_DB_MANIFEST_JSON`, and the
-least-scope `SOCKET_API_TOKEN` belong only to the owner-approved `preview-build`
-and `production-build` environments. The platform repository alone owns the
-trusted-main `dependency-scan` token. Publish, preview-operations, and
-supply-chain environments are secretless for Medlock. The `production` deploy
-environment contains only its `WAITLIST_IDENTITY_KEYSET`; the trusted preview
-deploy generates a revision-local key without a reusable preview credential. All
-other runtime configuration, including the production Firestore backend and
-memory-only preview mode, is selected in reviewed platform code rather than
-repository variables.
+The sole credential-bearing build environment is
+`dhi-base-prefetch-20260822-098dca9280b3`, shared by preview and production.
+It contains exactly the public-read-only
+`DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3` secret and the non-confidential
+`DHI_USERNAME` variable. No Socket token, mutable Grype database manifest, or
+`WAITLIST_IDENTITY_KEYSET` exists at any GitHub scope. Socket uses public
+policy, Grype data is byte-pinned in the reviewed platform commit, and the
+trusted deploy manages the production waitlist key directly in Secret Manager.
+After inventory proof and old provider-token revocation, the retired
+`preview-build`, `production-build`, and `dependency-scan` environments
+must be empty and deleted. Publish, deploy, preview-operations, and supply-chain
+environments remain secretless for Medlock. All other runtime configuration,
+including the production Firestore backend and memory-only preview mode, is
+selected in reviewed platform code rather than repository variables.
 
 Build, Artifact Registry publication, Cloud Run deployment, preview operations, and supply-chain attestation use separate protected environments and least-scope identities. External-fork and Dependabot pull requests receive neither those environment secrets nor a cloud preview.

@@ -1,7 +1,9 @@
 name: Deploy preview
 
 on:
-  pull_request:
+  pull_request_target:
+    branches:
+      - main
     types:
       - opened
       - synchronize
@@ -18,7 +20,8 @@ jobs:
       github.event.action == 'converted_to_draft'
     permissions:
       id-token: write # Exchange only for the exact-SHA preview traffic operator.
-    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@161ac5c7541073efe974499b67aaa607b8b77ee1
+      pull-requests: read # Let the reusable cleanup re-read current lifecycle state.
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@ddaa918319be123c780876d510efb4715c1f879d
 
   deploy:
     needs: invalidate
@@ -32,12 +35,5 @@ jobs:
       attestations: write # Publish provenance and SBOM attestations for the copied digest.
       contents: read
       id-token: write # Exchange only through the exact reusable-workflow environment paths.
-      packages: write # Publish and remove only the isolated GHCR staging image.
       pull-requests: write # Post the exact-head preview URL after deployment.
-    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@161ac5c7541073efe974499b67aaa607b8b77ee1
-    secrets:
-      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}
-      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
-      GRYPE_DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}
-      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}
-      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}
+    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@ddaa918319be123c780876d510efb4715c1f879d
