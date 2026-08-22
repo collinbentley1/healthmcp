@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { connect } from "node:net";
 import { getRuntimeConfig } from "../src/config.ts";
 import { createHandler, startServer } from "../src/server.ts";
 import { MemoryWaitlistStore, type WaitlistStore } from "../src/waitlist.ts";
+
+const UTF8 = new TextEncoder();
 
 const config = getRuntimeConfig({
   ALLOWED_HOSTS: "localhost,127.0.0.1,healthmcp.ai,www.medlock.ai,medlock.ai",
@@ -52,15 +55,51 @@ describe("server", () => {
       expect(await response.text()).toBe("method not allowed");
     }
 
+    const pageGet = await handler(new Request("http://localhost/"));
     const pageHead = await handler(new Request("http://localhost/", { method: "HEAD" }));
+    const liveGet = await handler(new Request("http://localhost/livez"));
     const liveHead = await handler(new Request("http://localhost/livez", { method: "HEAD" }));
+    const pageBody = await pageGet.text();
+    const liveBody = await liveGet.text();
 
     expect(pageHead.status).toBe(200);
+    expect(pageHead.body).toBeNull();
     expect(pageHead.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+    expect(pageHead.headers.get("Content-Length")).toBe(pageGet.headers.get("Content-Length"));
+    expect(Number(pageGet.headers.get("Content-Length"))).toBe(UTF8.encode(pageBody).byteLength);
     expect(await pageHead.text()).toBe("");
     expect(liveHead.status).toBe(200);
+    expect(liveHead.body).toBeNull();
     expect(liveHead.headers.get("Content-Type")).toContain("application/json");
+    expect(liveHead.headers.get("Content-Length")).toBe(liveGet.headers.get("Content-Length"));
+    expect(Number(liveGet.headers.get("Content-Length"))).toBe(UTF8.encode(liveBody).byteLength);
     expect(await liveHead.text()).toBe("");
+  });
+
+  test("preserves GET representation lengths on HEAD over HTTP", async () => {
+    const server = startServer({ ...config, port: 0 });
+    const port = server.port;
+    if (port === undefined) {
+      server.stop(true);
+      throw new Error("ephemeral test server did not expose its assigned port");
+    }
+
+    try {
+      for (const pathname of ["/", "/livez"]) {
+        const get = await rawHttpRequest(port, "GET", pathname);
+        const head = await rawHttpRequest(port, "HEAD", pathname);
+
+        expect(get.status).toBe(200);
+        expect(head.status).toBe(200);
+        expect(get.body.byteLength).toBe(Number(get.headers.get("content-length")));
+        expect(head.body.byteLength).toBe(0);
+        expect(head.headers.get("content-length")).toBe(get.headers.get("content-length"));
+        expect(head.headers.has("content-encoding")).toBe(false);
+        expect(head.headers.has("transfer-encoding")).toBe(false);
+      }
+    } finally {
+      server.stop(true);
+    }
   });
 
   test("echoes the platform deployment nonce at /livez when configured", async () => {
@@ -312,3 +351,55 @@ describe("server", () => {
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("https://medlock.ai");
   });
 });
+
+type RawHttpResponse = {
+  readonly body: Buffer;
+  readonly headers: ReadonlyMap<string, string>;
+  readonly status: number;
+};
+
+async function rawHttpRequest(port: number, method: "GET" | "HEAD", pathname: string): Promise<RawHttpResponse> {
+  return await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const socket = connect(port, "127.0.0.1");
+
+    socket.once("connect", () => {
+      socket.end(`${method} ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+    });
+    socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    socket.once("error", reject);
+    socket.once("end", () => {
+      try {
+        const response = Buffer.concat(chunks);
+        const headerBoundary = response.indexOf("\r\n\r\n");
+        if (headerBoundary < 0) {
+          throw new Error("raw HTTP response did not contain a header boundary");
+        }
+
+        const headerLines = response.subarray(0, headerBoundary).toString("latin1").split("\r\n");
+        const statusLine = headerLines.shift();
+        const status = Number(statusLine?.split(" ")[1]);
+        if (!Number.isInteger(status)) {
+          throw new Error("raw HTTP response did not contain a valid status");
+        }
+
+        const headers = new Map<string, string>();
+        for (const line of headerLines) {
+          const separator = line.indexOf(":");
+          if (separator < 1) {
+            throw new Error("raw HTTP response contained a malformed header");
+          }
+          headers.set(line.slice(0, separator).toLowerCase(), line.slice(separator + 1).trim());
+        }
+
+        resolve({
+          body: response.subarray(headerBoundary + 4),
+          headers,
+          status,
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}

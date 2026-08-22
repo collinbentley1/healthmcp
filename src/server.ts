@@ -20,6 +20,7 @@ type ServerDependencies = {
 
 export const MAX_REQUEST_BODY_SIZE = 1_048_576;
 const MAX_WAITLIST_BODY_SIZE = 8_192;
+const UTF8 = new TextEncoder();
 
 const CONTENT_TYPES: Readonly<Record<string, string>> = {
   ".css": "text/css; charset=utf-8",
@@ -48,7 +49,12 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
       }
 
       const deployment = Bun.env.PLATFORM_DEPLOY_NONCE;
-      const response = json(deployment ? { ok: true, deployment } : { ok: true });
+      const payload = deployment ? { ok: true, deployment } : { ok: true };
+      const response = json(payload, {
+        headers: {
+          "Content-Length": String(UTF8.encode(JSON.stringify(payload)).byteLength),
+        },
+      });
       return request.method === "HEAD" ? withoutBody(response) : response;
     }
 
@@ -255,6 +261,7 @@ async function serveStatic(pathname: string, config: RuntimeConfig, headOnly = f
     new Response(headOnly ? null : file, {
       headers: {
         "Cache-Control": normalizedPath === "index.html" || normalizedPath === "scan.html" ? "no-cache" : "public, max-age=300",
+        "Content-Length": String(file.size),
         "Content-Type": CONTENT_TYPES[extname(filePath)] ?? "application/octet-stream",
       },
     }),
@@ -262,8 +269,12 @@ async function serveStatic(pathname: string, config: RuntimeConfig, headOnly = f
 }
 
 function withoutBody(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.delete("Content-Encoding");
+  headers.delete("Transfer-Encoding");
+
   return new Response(null, {
-    headers: response.headers,
+    headers,
     status: response.status,
     statusText: response.statusText,
   });
