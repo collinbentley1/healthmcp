@@ -52,7 +52,7 @@ Each claim below cites the file that implements it.
 - **Single request handler.** `src/server.ts` routes `/api/mcp` to the MCP transport, `/api/waitlist` to the waitlist store, and everything else to static assets, with canonical-host 308 redirects for legacy domains (`src/http.ts`, `src/config.ts`).
 - **Bearer auth for private deployments.** When `MEDLOCK_MCP_TOKEN` is set, MCP requests without the matching `Authorization: Bearer` header get 401 (`authenticate()` in `src/mcp.ts`; `src/config.ts`). Without a token, requests run as an anonymous demo client with `demo:read` scope. The `medlock://context` resource states the rule: connect real Solid Pods only through a private deployment with the token configured (`src/mcp.ts`).
 - **Origin and host allow-listing.** MCP requests from origins outside the allow-list get 403; the same applies to unrecognized `Host` values (`isTrustedOrigin`/`isTrustedHost` in `src/http.ts`, enforced in `src/mcp.ts`; defaults, including `https://claude.ai` and `https://chat.openai.com`, in `src/config.ts`). CORS headers echo only allow-listed origins.
-- **Rate limiting.** A bounded in-memory limiter (`src/rate-limit.ts`) caps the waitlist API at 5 requests per minute per server-minted, HMAC-authenticated client cookie and 60 requests per minute per instance (`handleWaitlist()` in `src/server.ts`). The application neither trusts forwarding headers nor collapses unrelated Cloud Run clients onto a proxy socket. The MCP endpoint itself is not rate-limited in application code.
+- **Rate limiting.** A bounded in-memory limiter (`src/rate-limit.ts`) atomically caps the waitlist API on each Cloud Run instance at 5 requests per minute per server-minted, HMAC-authenticated client cookie and 60 requests per minute in aggregate (`handleWaitlist()` in `src/server.ts`). Requests without an authenticated cookie also share a per-instance 5-per-minute establishment budget, so discarding cookies cannot rotate through that instance's global budget. These counters reset on instance churn and do not coordinate across the configured maximum of 10 instances; they are abuse friction, not a human-identity or organization-wide quota. A rejected client does not consume any other limiter bucket. The application neither trusts forwarding headers nor collapses unrelated Cloud Run clients onto a proxy socket. The MCP endpoint itself is not rate-limited in application code.
 - **Response headers.** Site pages and API responses carry a CSP with `default-src 'self'` and no `unsafe-inline`, `frame-ancestors 'none'`, COOP/CORP `same-origin`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a Permissions-Policy disabling camera, geolocation, microphone, and payment (`SECURITY_HEADERS` in `src/http.ts`). API CORS advertises only POST and OPTIONS and echoes only allow-listed origins.
 - **Request body limits.** Bun rejects request bodies larger than 1 MiB, MCP reads at most 64 KiB and rejects JSON-RPC batches, and the waitlist route reads at most 8 KiB before parsing JSON (`src/mcp.ts`, `src/server.ts`).
 - **Honest demo data.** Deterministic sample vitals (`src/vitals.ts`) with the disclosure wired through the protocol surface as described above (`src/mcp.ts`).
@@ -142,6 +142,7 @@ Environment variables:
 - `PORT`: HTTP port, default `3000`
 - `PUBLIC_DIR`: static asset directory override
 - `WAITLIST_BACKEND`: `file`, `memory`, or `firestore`; production uses `firestore`, pull request previews use `memory`
+- `WAITLIST_IDENTITY_KEYSET`: one unpadded base64url-encoded 32-byte signing key; deployed services require it. During production rotation, configure `new,old` so old cookies are accepted and immediately re-signed with `new`. After the 30-day cookie lifetime has elapsed, remove `old`. Production sources this value only from its protected GitHub deploy environment; the trusted platform deploy reuses the current exact Secret Manager version when the keyset is unchanged, otherwise streams it into a new version, and binds Cloud Run to that numeric version. The platform generates a revision-local preview value during each trusted deploy.
 
 ## Cloud Run Setup
 
@@ -154,15 +155,18 @@ The repository follows the shared platform contract:
 - `.github/workflows/deploy-preview.yml`: tagged pull request traffic on the single no-data `medlock-preview` service
 - `.github/workflows/reconcile-previews.yml`: exact-revision cleanup and reconciliation for shared preview traffic
 
-Every caller and Terraform mirror pins the same reviewed full platform SHA. Authenticated infrastructure work checks out only that platform commit and selects the immutable platform-owned deployment configuration by numeric GitHub repository ID; it never executes consumer HCL. Bootstrap, production, and public-exposure changes must run through the owner-controlled, review-gated pipeline against `platform/terraform/deployments`, not a manual apply from this repository. Actions may be enabled only after that pipeline, its state migration, exact-SHA WIF, and SHA-only enforcement are verified. See the [pinned security rollout](https://github.com/collinbentley1/platform/blob/09d037c012ae09c5a460d1ee52579eca9b101569/docs/security-rollout.md).
+Every caller and Terraform mirror pins the same reviewed full platform SHA. Authenticated infrastructure work checks out only that platform commit and selects the immutable platform-owned deployment configuration by numeric GitHub repository ID; it never executes consumer HCL. Bootstrap, production, and public-exposure changes must run through the owner-controlled, review-gated pipeline against `platform/terraform/deployments`, not a manual apply from this repository. Actions may be enabled only after that pipeline, its state migration, exact-SHA WIF, and SHA-only enforcement are verified. See the [pinned security rollout](https://github.com/collinbentley1/platform/blob/161ac5c7541073efe974499b67aaa607b8b77ee1/docs/security-rollout.md).
 
 Do not define `GCP_*` repository variables or repository-level deploy secrets.
 Rotated `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, `GRYPE_DB_MANIFEST_JSON`, and the
 least-scope `SOCKET_API_TOKEN` belong only to the owner-approved `preview-build`
 and `production-build` environments. The platform repository alone owns the
-trusted-main `dependency-scan` token. Publish, cloud-deploy, preview-operations,
-and supply-chain environments are otherwise secretless for Medlock. Runtime
-configuration, including the production Firestore backend and memory-only preview
-mode, is selected in reviewed platform code rather than repository variables.
+trusted-main `dependency-scan` token. Publish, preview-operations, and
+supply-chain environments are secretless for Medlock. The `production` deploy
+environment contains only its `WAITLIST_IDENTITY_KEYSET`; the trusted preview
+deploy generates a revision-local key without a reusable preview credential. All
+other runtime configuration, including the production Firestore backend and
+memory-only preview mode, is selected in reviewed platform code rather than
+repository variables.
 
 Build, Artifact Registry publication, Cloud Run deployment, preview operations, and supply-chain attestation use separate protected environments and least-scope identities. External-fork and Dependabot pull requests receive neither those environment secrets nor a cloud preview.

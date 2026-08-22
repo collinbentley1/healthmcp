@@ -2,7 +2,7 @@ import { extname, join, normalize } from "node:path";
 import { BUILT_PUBLIC_DIR, getRuntimeConfig, type RuntimeConfig } from "./config.ts";
 import { corsHeaders, json, shouldRedirectToCanonical, text, withSecurityHeaders, type JsonResponseOptions } from "./http.ts";
 import { createMcpEndpoint, type McpEndpoint } from "./mcp.ts";
-import { InMemoryRateLimiter } from "./rate-limit.ts";
+import { InMemoryRateLimiter, type RateLimitRule } from "./rate-limit.ts";
 import {
   createWaitlistIdentitySecret,
   resolveWaitlistClient,
@@ -14,7 +14,7 @@ type ServerDependencies = {
   readonly mcpEndpoint?: McpEndpoint;
   readonly now?: () => Date;
   readonly rateLimiter?: InMemoryRateLimiter;
-  readonly waitlistIdentitySecret?: Uint8Array;
+  readonly waitlistIdentitySecrets?: readonly Uint8Array[];
   readonly waitlistStore?: WaitlistStore;
 };
 
@@ -38,8 +38,11 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
-  const waitlistIdentitySecret =
-    dependencies.waitlistIdentitySecret ?? createWaitlistIdentitySecret();
+  const waitlistIdentitySecrets =
+    dependencies.waitlistIdentitySecrets ??
+    (config.waitlistIdentitySecrets.length > 0
+      ? config.waitlistIdentitySecrets
+      : [createWaitlistIdentitySecret()]);
 
   return async function handleRequest(request: Request): Promise<Response> {
     const healthUrl = new URL(request.url);
@@ -72,7 +75,7 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           config,
           waitlistStore,
           rateLimiter,
-          waitlistIdentitySecret,
+          waitlistIdentitySecrets,
           now,
         );
       }
@@ -132,7 +135,7 @@ async function handleWaitlist(
   config: RuntimeConfig,
   store: WaitlistStore,
   rateLimiter: InMemoryRateLimiter,
-  identitySecret: Uint8Array,
+  identitySecrets: readonly Uint8Array[],
   now: () => Date,
 ): Promise<Response> {
   if (request.method === "OPTIONS") {
@@ -143,17 +146,20 @@ async function handleWaitlist(
     return apiJson({ error: "method not allowed" }, request, config, { headers: { Allow: "POST, OPTIONS" }, status: 405 });
   }
 
-  const client = resolveWaitlistClient(request, identitySecret);
+  const client = resolveWaitlistClient(request, identitySecrets);
   const respond = (response: Response): Response => withWaitlistClientCookie(response, client.setCookie);
 
-  const globalDecision = rateLimiter.check("waitlist:global", 60, 60_000);
-  if (!globalDecision.allowed) {
-    return respond(rateLimitedWaitlistResponse(request, config, globalDecision.retryAfterSeconds));
+  const rules: RateLimitRule[] = [
+    { key: `waitlist:client:${client.id}`, limit: 5, windowMs: 60_000 },
+    { key: "waitlist:global", limit: 60, windowMs: 60_000 },
+  ];
+  if (!client.authenticated) {
+    rules.unshift({ key: "waitlist:unestablished", limit: 5, windowMs: 60_000 });
   }
-
-  const decision = rateLimiter.check(`waitlist:${client.id}`, 5, 60_000);
+  const decision = rateLimiter.checkMany(rules);
   if (!decision.allowed) {
-    return respond(rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds));
+    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+    return client.authenticated ? respond(response) : response;
   }
 
   const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase();

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { connect } from "node:net";
 import { getRuntimeConfig } from "../src/config.ts";
 import { createHandler, startServer } from "../src/server.ts";
+import { resolveWaitlistClient } from "../src/waitlist-client.ts";
 import { MemoryWaitlistStore, type WaitlistStore } from "../src/waitlist.ts";
 
 const UTF8 = new TextEncoder();
@@ -91,9 +92,19 @@ describe("server", () => {
 
         expect(get.status).toBe(200);
         expect(head.status).toBe(200);
-        expect(get.headers.get("content-length")).toEqual([String(get.body.byteLength)]);
+        const getContentLength = get.headers.get("content-length");
+        const getTransferEncoding = get.headers.get("transfer-encoding");
+        expect(
+          (getContentLength?.length === 1 &&
+            getContentLength[0] === String(get.body.byteLength) &&
+            getTransferEncoding === undefined) ||
+            (getContentLength === undefined &&
+              getTransferEncoding?.length === 1 &&
+              getTransferEncoding[0]?.toLowerCase() === "chunked"),
+        ).toBe(true);
         expect(head.body.byteLength).toBe(0);
-        expect(head.headers.get("content-length")).toEqual(get.headers.get("content-length"));
+        expect(head.headers.get("content-length")).toEqual([String(get.body.byteLength)]);
+        expect(get.headers.has("content-encoding")).toBe(false);
         expect(head.headers.has("content-encoding")).toBe(false);
         expect(head.headers.has("transfer-encoding")).toBe(false);
       }
@@ -163,7 +174,7 @@ describe("server", () => {
   test("accepts waitlist JSON and ignores spoofed forwarding headers when rate limiting", async () => {
     const handler = createHandler({
       config,
-      waitlistIdentitySecret: new Uint8Array(32).fill(7),
+      waitlistIdentitySecrets: [new Uint8Array(32).fill(7)],
       waitlistStore: new MemoryWaitlistStore(),
     });
     let requestIndex = 0;
@@ -198,7 +209,7 @@ describe("server", () => {
     const server = startServer(
       { ...config, port: 0 },
       {
-        waitlistIdentitySecret: new Uint8Array(32).fill(8),
+        waitlistIdentitySecrets: [new Uint8Array(32).fill(8)],
         waitlistStore: new MemoryWaitlistStore(),
       },
     );
@@ -251,19 +262,60 @@ describe("server", () => {
     }
   });
 
-  test("caps aggregate waitlist traffic even when client cookies differ", async () => {
-    const handler = createHandler({ config, waitlistStore: new MemoryWaitlistStore() });
-    const request = () =>
+  test("caps cookie-discarding callers before they can rotate through the global budget", async () => {
+    const handler = createHandler({
+      config,
+      waitlistIdentitySecrets: [new Uint8Array(32).fill(9)],
+      waitlistStore: new MemoryWaitlistStore(),
+    });
+    const request = (index: number) =>
       new Request("http://localhost/api/waitlist", {
-        body: JSON.stringify({ email: "person@example.com" }),
+        body: JSON.stringify({ email: `discarded-${index}@example.com` }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
 
-    for (let index = 0; index < 60; index += 1) {
-      expect((await handler(request())).status).toBe(202);
+    for (let index = 0; index < 5; index += 1) {
+      expect((await handler(request(index))).status).toBe(202);
     }
-    expect((await handler(request())).status).toBe(429);
+    const rejected = await handler(request(5));
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.get("set-cookie")).toBeNull();
+    expect((await handler(request(6))).status).toBe(429);
+  });
+
+  test("caps aggregate waitlist traffic across authenticated client cookies", async () => {
+    const identitySecret = new Uint8Array(32).fill(10);
+    const handler = createHandler({
+      config,
+      waitlistIdentitySecrets: [identitySecret],
+      waitlistStore: new MemoryWaitlistStore(),
+    });
+    const cookies = Array.from({ length: 13 }, () => {
+      const identity = resolveWaitlistClient(
+        new Request("https://medlock.ai/api/waitlist"),
+        [identitySecret],
+      );
+      const cookie = identity.setCookie?.split(";", 1)[0];
+      if (!cookie) {
+        throw new Error("expected a signed test client cookie");
+      }
+      return cookie;
+    });
+    const request = (cookie: string, index: number) =>
+      new Request("http://localhost/api/waitlist", {
+        body: JSON.stringify({ email: `aggregate-${index}@example.com` }),
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        method: "POST",
+      });
+
+    let requestIndex = 0;
+    for (const cookie of cookies.slice(0, 12)) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        expect((await handler(request(cookie, requestIndex++))).status).toBe(202);
+      }
+    }
+    expect((await handler(request(cookies[12]!, requestIndex))).status).toBe(429);
   });
 
   test("applies the hardened response boundary to waitlist preflights", async () => {
@@ -365,7 +417,7 @@ async function rawHttpRequest(port: number, method: "GET" | "HEAD", pathname: st
     socket.setTimeout(5_000);
 
     socket.once("connect", () => {
-      socket.end(`${method} ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+      socket.write(`${method} ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
     });
     socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
     socket.once("timeout", () => socket.destroy(new Error("raw HTTP response timed out")));
@@ -397,8 +449,15 @@ async function rawHttpRequest(port: number, method: "GET" | "HEAD", pathname: st
           headers.set(name, values);
         }
 
+        const encodedBody = response.subarray(headerBoundary + 4);
+        const transferEncoding = headers.get("transfer-encoding");
+        const body =
+          transferEncoding?.length === 1 && transferEncoding[0]?.toLowerCase() === "chunked"
+            ? decodeChunkedBody(encodedBody)
+            : encodedBody;
+
         resolve({
-          body: response.subarray(headerBoundary + 4),
+          body,
           headers,
           status,
         });
@@ -407,4 +466,39 @@ async function rawHttpRequest(port: number, method: "GET" | "HEAD", pathname: st
       }
     });
   });
+}
+
+function decodeChunkedBody(encoded: Buffer): Buffer {
+  const chunks: Buffer[] = [];
+  let offset = 0;
+
+  while (offset < encoded.byteLength) {
+    const sizeLineEnd = encoded.indexOf("\r\n", offset);
+    if (sizeLineEnd < 0) {
+      throw new Error("chunked HTTP response did not contain a complete size line");
+    }
+
+    const sizeText = encoded.subarray(offset, sizeLineEnd).toString("ascii");
+    if (!/^[0-9a-f]+$/i.test(sizeText)) {
+      throw new Error("chunked HTTP response contained an invalid chunk size");
+    }
+
+    const size = Number.parseInt(sizeText, 16);
+    offset = sizeLineEnd + 2;
+    if (size === 0) {
+      if (encoded.subarray(offset).toString("ascii") !== "\r\n") {
+        throw new Error("chunked HTTP response contained trailers or trailing bytes");
+      }
+      return Buffer.concat(chunks);
+    }
+
+    const chunkEnd = offset + size;
+    if (chunkEnd + 2 > encoded.byteLength || encoded.subarray(chunkEnd, chunkEnd + 2).toString("ascii") !== "\r\n") {
+      throw new Error("chunked HTTP response contained an incomplete chunk");
+    }
+    chunks.push(encoded.subarray(offset, chunkEnd));
+    offset = chunkEnd + 2;
+  }
+
+  throw new Error("chunked HTTP response did not contain a terminating chunk");
 }

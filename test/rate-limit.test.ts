@@ -20,4 +20,17 @@ describe("InMemoryRateLimiter", () => {
     expect(limiter.check("new", 1, 60_000, 4).allowed).toBeTrue();
     expect(limiter.trackedKeyCount).toBe(2);
   });
+
+  test("does not charge unrelated budgets when one rule rejects the request", () => {
+    const limiter = new InMemoryRateLimiter();
+    const rules = (client: string) => [
+      { key: `client:${client}`, limit: 1, windowMs: 60_000 },
+      { key: "global", limit: 2, windowMs: 60_000 },
+    ];
+
+    expect(limiter.checkMany(rules("first"), 1).allowed).toBeTrue();
+    expect(limiter.checkMany(rules("first"), 2).allowed).toBeFalse();
+    expect(limiter.checkMany(rules("second"), 3).allowed).toBeTrue();
+    expect(limiter.checkMany(rules("third"), 4).allowed).toBeFalse();
+  });
 });

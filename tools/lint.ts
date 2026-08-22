@@ -38,6 +38,16 @@ await requireContains(
   "timingSafeEqual",
   "Waitlist cookie authentication must compare signatures in constant time.",
 );
+await requireContains(
+  "src/server.ts",
+  "rateLimiter.checkMany(rules)",
+  "Waitlist client, establishment, and global rate limits must commit atomically.",
+);
+await requireContains(
+  "src/config.ts",
+  "WAITLIST_IDENTITY_KEYSET is required for deployed services and the Firestore waitlist",
+  "Deployed waitlist cookies must use stable environment-scoped signing secrets.",
+);
 await rejectContains("package.json", "next", "Next.js should not remain in the pure Bun runtime.");
 
 await import("./verify-socket-config.ts");

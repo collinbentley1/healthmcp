@@ -46,8 +46,22 @@ variable "preview_runtime_service_account_email" {
   default     = "cloud-run-preview@medlock-1025243085.iam.gserviceaccount.com"
 }
 
+variable "preview_ingress" {
+  description = "Ingress policy for the shared preview Cloud Run service."
+  type        = string
+  default     = "INGRESS_TRAFFIC_ALL"
+
+  validation {
+    condition = contains([
+      "INGRESS_TRAFFIC_ALL",
+      "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+    ], var.preview_ingress)
+    error_message = "preview_ingress must allow all traffic or only internal and Cloud Load Balancing traffic."
+  }
+}
+
 variable "prod_deploy_service_account_email" {
-  description = "Production deploy service account email with exact-repository read access."
+  description = "Production deploy service account email with exact-repository read access and only declared exact-secret version-add grants."
   type        = string
   default     = "gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
 }
@@ -65,7 +79,7 @@ variable "preview_deploy_service_account_email" {
 }
 
 variable "preview_operator_service_account_email" {
-  description = "Preview traffic operator service account email with downloadArtifacts-only access to the exact preview repository and no runtime actAs access."
+  description = "Deprecated transition-only preview operator email retained for input compatibility; receives no IAM grant."
   type        = string
   default     = "gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com"
 }
@@ -79,16 +93,33 @@ variable "preview_publisher_service_account_email" {
 variable "runtime_secret_ids" {
   description = "Secret Manager secret containers retained by the platform; does not grant runtime access."
   type        = set(string)
-  default     = []
+  default = [
+    "waitlist-identity-keyset",
+  ]
 }
 
 variable "runtime_secret_accessor_ids" {
   description = "Declared runtime secret IDs whose payloads the production runtime may read."
   type        = set(string)
-  default     = []
+  default = [
+    "waitlist-identity-keyset",
+  ]
 
   validation {
     condition     = length(setsubtract(var.runtime_secret_accessor_ids, var.runtime_secret_ids)) == 0
     error_message = "runtime_secret_accessor_ids must be a subset of runtime_secret_ids."
+  }
+}
+
+variable "runtime_secret_version_adder_ids" {
+  description = "Declared runtime secret IDs to which the production deploy identity may add immutable versions."
+  type        = set(string)
+  default = [
+    "waitlist-identity-keyset",
+  ]
+
+  validation {
+    condition     = length(setsubtract(var.runtime_secret_version_adder_ids, var.runtime_secret_ids)) == 0
+    error_message = "runtime_secret_version_adder_ids must be a subset of runtime_secret_ids."
   }
 }

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Buffer } from "node:buffer";
 import { getRuntimeConfig } from "../src/config.ts";
 import { createHandler } from "../src/server.ts";
 import { MemoryWaitlistStore } from "../src/waitlist.ts";
@@ -172,6 +173,32 @@ describe("initialize probe", () => {
 
   test("rejects weak private-deployment bearer tokens during configuration", () => {
     expect(() => getRuntimeConfig({ MEDLOCK_MCP_TOKEN: "too-short" })).toThrow("at least 32 bytes");
+  });
+
+  test("requires stable waitlist identity secrets in deployed services and accepts one prior key", () => {
+    const active = Buffer.alloc(32, 21).toString("base64url");
+    const prior = Buffer.alloc(32, 22).toString("base64url");
+
+    expect(() =>
+      getRuntimeConfig({ PLATFORM_DEPLOY_ENVIRONMENT: "production" }),
+    ).toThrow("WAITLIST_IDENTITY_KEYSET is required");
+    expect(() =>
+      getRuntimeConfig({ WAITLIST_BACKEND: "firestore" }),
+    ).toThrow("WAITLIST_IDENTITY_KEYSET is required");
+    expect(() =>
+      getRuntimeConfig({
+        PLATFORM_DEPLOY_ENVIRONMENT: "preview",
+        WAITLIST_IDENTITY_KEYSET: `${active},${active}`,
+      }),
+    ).toThrow("distinct prior key");
+
+    const config = getRuntimeConfig({
+      PLATFORM_DEPLOY_ENVIRONMENT: "production",
+      WAITLIST_IDENTITY_KEYSET: `${active},${prior}`,
+    });
+    expect(config.deploymentEnvironment).toBe("production");
+    expect(config.waitlistIdentitySecrets).toHaveLength(2);
+    expect(config.waitlistIdentitySecrets[0]?.byteLength).toBe(32);
   });
 
   test("rejects JSON-RPC batches and oversized MCP bodies", async () => {

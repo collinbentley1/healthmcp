@@ -1,10 +1,12 @@
 import { join } from "node:path";
+import { Buffer } from "node:buffer";
 
 export type RuntimeConfig = {
   readonly allowedHosts: readonly string[];
   readonly allowedOrigins: readonly string[];
   readonly canonicalHost: string;
   readonly dataDir: string;
+  readonly deploymentEnvironment: "preview" | "production" | undefined;
   readonly firestoreCollection: string;
   readonly firestoreDatabaseId: string;
   readonly firestoreProjectId: string | undefined;
@@ -14,6 +16,7 @@ export type RuntimeConfig = {
   readonly publicDir: string;
   readonly version: string;
   readonly waitlistBackend: "file" | "firestore" | "memory";
+  readonly waitlistIdentitySecrets: readonly Uint8Array[];
 };
 
 const DEFAULT_ALLOWED_HOSTS = [
@@ -49,11 +52,19 @@ export const BUILT_PUBLIC_DIR = import.meta.dir.endsWith("/dist")
   : join(import.meta.dir, "..", "dist", "public");
 
 export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.env): RuntimeConfig {
+  const deploymentEnvironment = parseDeploymentEnvironment(env.PLATFORM_DEPLOY_ENVIRONMENT);
+  const waitlistIdentitySecrets = parseWaitlistIdentitySecrets(env.WAITLIST_IDENTITY_KEYSET);
+  const waitlistBackend = parseWaitlistBackend(env.WAITLIST_BACKEND);
+  if ((deploymentEnvironment || waitlistBackend === "firestore") && waitlistIdentitySecrets.length === 0) {
+    throw new Error("WAITLIST_IDENTITY_KEYSET is required for deployed services and the Firestore waitlist.");
+  }
+
   return {
     allowedHosts: parseList(env.ALLOWED_HOSTS, DEFAULT_ALLOWED_HOSTS),
     allowedOrigins: parseList(env.ALLOWED_ORIGINS, DEFAULT_ALLOWED_ORIGINS),
     canonicalHost: env.CANONICAL_HOST ?? "medlock.ai",
     dataDir: env.DATA_DIR ?? join(import.meta.dir, "..", ".data"),
+    deploymentEnvironment,
     firestoreCollection: env.FIRESTORE_COLLECTION ?? "waitlist",
     firestoreDatabaseId: env.FIRESTORE_DATABASE_ID ?? "(default)",
     firestoreProjectId: present(env.FIRESTORE_PROJECT_ID ?? env.GOOGLE_CLOUD_PROJECT),
@@ -62,8 +73,44 @@ export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.e
     port: Number(env.PORT ?? 3000),
     publicDir: env.PUBLIC_DIR ?? (import.meta.dir.endsWith("/dist") ? BUILT_PUBLIC_DIR : SOURCE_PUBLIC_DIR),
     version: env.MEDLOCK_VERSION ?? "0.2.0",
-    waitlistBackend: parseWaitlistBackend(env.WAITLIST_BACKEND),
+    waitlistBackend,
+    waitlistIdentitySecrets,
   };
+}
+
+function parseDeploymentEnvironment(
+  value: string | undefined,
+): RuntimeConfig["deploymentEnvironment"] {
+  const environment = present(value);
+  if (!environment) {
+    return undefined;
+  }
+  if (environment === "preview" || environment === "production") {
+    return environment;
+  }
+  throw new Error("PLATFORM_DEPLOY_ENVIRONMENT must be preview or production when configured.");
+}
+
+function parseWaitlistIdentitySecrets(value: string | undefined): Uint8Array[] {
+  if (!value) {
+    return [];
+  }
+
+  const encodedSecrets = value.split(",");
+  if (encodedSecrets.length < 1 || encodedSecrets.length > 2 || new Set(encodedSecrets).size !== encodedSecrets.length) {
+    throw new Error("WAITLIST_IDENTITY_KEYSET must contain one active key and at most one distinct prior key.");
+  }
+
+  return encodedSecrets.map((encoded) => {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(encoded)) {
+      throw new Error("WAITLIST_IDENTITY_KEYSET values must be unpadded base64url-encoded 32-byte keys.");
+    }
+    const decoded = Buffer.from(encoded, "base64url");
+    if (decoded.byteLength !== 32 || decoded.toString("base64url") !== encoded) {
+      throw new Error("WAITLIST_IDENTITY_KEYSET values must use canonical base64url encoding.");
+    }
+    return Uint8Array.from(decoded);
+  });
 }
 
 export function hostNameFromHeader(hostHeader: string | null): string {

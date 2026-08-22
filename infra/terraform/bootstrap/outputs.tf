@@ -19,7 +19,7 @@ output "terraform_service_account_email" {
 }
 
 output "prod_deploy_service_account_email" {
-  description = "Cloud Run deploy service account with read-only access to the exact production image repository."
+  description = "Cloud Run deploy service account with read-only access to the exact production image repository and only declared exact-secret version-add grants."
   value       = module.bootstrap.prod_deploy_service_account_email
 }
 
@@ -34,7 +34,7 @@ output "preview_deploy_service_account_email" {
 }
 
 output "preview_operator_service_account_email" {
-  description = "Preview traffic-reconciliation service account with downloadArtifacts-only access to the exact preview repository."
+  description = "Retired transition-only preview operator service account; receives no steady-state operational grants."
   value       = module.bootstrap.preview_operator_service_account_email
 }
 

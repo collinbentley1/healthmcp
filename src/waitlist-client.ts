@@ -5,6 +5,7 @@ const COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const MAX_COOKIE_HEADER_LENGTH = 4_096;
 
 export type WaitlistClientIdentity = {
+  readonly authenticated: boolean;
   readonly id: string;
   readonly setCookie?: string;
 };
@@ -15,27 +16,43 @@ export function createWaitlistIdentitySecret(): Uint8Array {
 
 export function resolveWaitlistClient(
   request: Request,
-  secret: Uint8Array,
+  secrets: readonly Uint8Array[],
 ): WaitlistClientIdentity {
-  if (secret.byteLength < 32) {
-    throw new Error("waitlist identity secret must contain at least 32 random bytes");
+  if (
+    secrets.length < 1 ||
+    secrets.length > 2 ||
+    secrets.some((secret) => secret.byteLength < 32)
+  ) {
+    throw new Error("waitlist identity secrets must contain one or two values of at least 32 random bytes");
   }
+  const [primarySecret] = secrets;
 
   const existing = readCookie(request.headers.get("cookie"));
   if (existing) {
     const [id, signature, extra] = existing.split(".");
-    if (!extra && id && signature && isValidId(id) && isAuthentic(id, signature, secret)) {
-      return { id };
+    if (!extra && id && signature && isValidId(id)) {
+      const secretIndex = secrets.findIndex((secret) => isAuthentic(id, signature, secret));
+      if (secretIndex === 0) {
+        return { authenticated: true, id };
+      }
+      if (secretIndex > 0) {
+        return { authenticated: true, id, setCookie: serializeCookie(id, primarySecret!) };
+      }
     }
   }
 
   const id = randomBytes(18).toString("base64url");
-  const value = `${id}.${sign(id, secret)}`;
 
   return {
+    authenticated: false,
     id,
-    setCookie: `${COOKIE_NAME}=${value}; Max-Age=${COOKIE_MAX_AGE_SECONDS}; Path=/api/waitlist; HttpOnly; SameSite=Strict; Secure`,
+    setCookie: serializeCookie(id, primarySecret!),
   };
+}
+
+function serializeCookie(id: string, secret: Uint8Array): string {
+  const value = `${id}.${sign(id, secret)}`;
+  return `${COOKIE_NAME}=${value}; Max-Age=${COOKIE_MAX_AGE_SECONDS}; Path=/api/waitlist; HttpOnly; SameSite=Strict; Secure`;
 }
 
 function readCookie(header: string | null): string | undefined {

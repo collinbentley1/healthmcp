@@ -10,7 +10,7 @@ describe("waitlist client identity", () => {
   test("mints an authenticated, host-only browser cookie and accepts it again", () => {
     const minted = resolveWaitlistClient(
       new Request("https://medlock.ai/api/waitlist"),
-      secret,
+      [secret],
     );
     const cookie = cookiePair(minted);
 
@@ -24,16 +24,16 @@ describe("waitlist client identity", () => {
       new Request("https://medlock.ai/api/waitlist", {
         headers: { Cookie: `unrelated=value; ${cookie}; another=value` },
       }),
-      secret,
+      [secret],
     );
 
-    expect(accepted).toEqual({ id: minted.id });
+    expect(accepted).toEqual({ authenticated: true, id: minted.id });
   });
 
   test("replaces forged, malformed, and oversized cookie values", () => {
     const minted = resolveWaitlistClient(
       new Request("https://medlock.ai/api/waitlist"),
-      secret,
+      [secret],
     );
     const cookie = cookiePair(minted);
     const forged = `${cookie.slice(0, -1)}${cookie.endsWith("a") ? "b" : "a"}`;
@@ -41,9 +41,10 @@ describe("waitlist client identity", () => {
     for (const value of [forged, "medlock_waitlist_client=invalid", `junk=${"a".repeat(4_097)}`]) {
       const replacement = resolveWaitlistClient(
         new Request("https://medlock.ai/api/waitlist", { headers: { Cookie: value } }),
-        secret,
+        [secret],
       );
 
+      expect(replacement.authenticated).toBeFalse();
       expect(replacement.id).not.toBe(minted.id);
       expect(replacement.setCookie).toStartWith("medlock_waitlist_client=");
     }
@@ -52,7 +53,7 @@ describe("waitlist client identity", () => {
   test("keeps the cookie Secure when TLS terminates before the Bun process", () => {
     const minted = resolveWaitlistClient(
       new Request("http://medlock-internal/api/waitlist"),
-      secret,
+      [secret],
     );
 
     expect(minted.setCookie).toContain("; Secure");
@@ -62,9 +63,34 @@ describe("waitlist client identity", () => {
     expect(() =>
       resolveWaitlistClient(
         new Request("https://medlock.ai/api/waitlist"),
-        new Uint8Array(31),
+        [new Uint8Array(31)],
       ),
     ).toThrow("at least 32 random bytes");
+  });
+
+  test("accepts one prior rotation secret and re-signs the same client with the active secret", () => {
+    const priorSecret = new Uint8Array(32).fill(12);
+    const mintedWithPrior = resolveWaitlistClient(
+      new Request("https://medlock.ai/api/waitlist"),
+      [priorSecret],
+    );
+    const priorCookie = cookiePair(mintedWithPrior);
+
+    const rotated = resolveWaitlistClient(
+      new Request("https://medlock.ai/api/waitlist", { headers: { Cookie: priorCookie } }),
+      [secret, priorSecret],
+    );
+    const rotatedCookie = cookiePair(rotated);
+
+    expect(rotated.authenticated).toBeTrue();
+    expect(rotated.id).toBe(mintedWithPrior.id);
+    expect(rotatedCookie).not.toBe(priorCookie);
+    expect(
+      resolveWaitlistClient(
+        new Request("https://medlock.ai/api/waitlist", { headers: { Cookie: rotatedCookie } }),
+        [secret],
+      ),
+    ).toEqual({ authenticated: true, id: mintedWithPrior.id });
   });
 });
 
