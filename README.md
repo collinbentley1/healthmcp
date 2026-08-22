@@ -86,12 +86,21 @@ The same probe runs in CI as a contract test: `test/initialize-probe.test.ts` st
 
 ## Local Development
 
+Medlock requires Bun `1.4.0` at the exact reviewed revision
+`34cbb9a40b4bd1bd767d134a7065e66c2432a676`, matching CI and the production
+container. Before installing dependencies or running a repository script, fail
+closed on the full embedded revision:
+
 ```sh
+bun -e 'if (Bun.version !== "1.4.0" || Bun.revision !== "34cbb9a40b4bd1bd767d134a7065e66c2432a676") throw new Error("Bun must be 1.4.0+34cbb9a40")'
 bun install
 bun run dev
 ```
 
-Medlock targets stable Bun 1.4. Run `bun upgrade --stable` to bring a local install up to date; the Docker image pins `bun-v1.4.0` exactly.
+Never install or upgrade Bun from a moving `stable`, `latest`, or `canary`
+channel for this repository. `bun --revision` is a convenient display check,
+but it abbreviates the commit; the assertion above is the canonical local
+check. The Docker image pins `bun-v1.4.0` exactly.
 
 Useful commands:
 
