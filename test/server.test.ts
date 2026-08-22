@@ -95,39 +95,63 @@ describe("server", () => {
   });
 
   test("accepts waitlist JSON and ignores spoofed forwarding headers when rate limiting", async () => {
-    const handler = createHandler({ config, waitlistStore: new MemoryWaitlistStore() });
+    const handler = createHandler({
+      config,
+      waitlistIdentitySecret: new Uint8Array(32).fill(7),
+      waitlistStore: new MemoryWaitlistStore(),
+    });
     let requestIndex = 0;
-    const request = () =>
+    const request = (cookie?: string) =>
       new Request("http://localhost/api/waitlist", {
         body: JSON.stringify({ email: "person@example.com" }),
         headers: {
+          ...(cookie ? { Cookie: cookie } : {}),
           "Content-Type": "application/json",
           "X-Forwarded-For": `203.0.113.${requestIndex++}`,
         },
         method: "POST",
       });
 
-    const response = await handler(request(), "192.0.2.10");
+    const response = await handler(request());
+    const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ ok: true });
+    expect(await response.json()).toEqual({ duplicate: false, ok: true });
+    expect(cookie).toStartWith("medlock_waitlist_client=");
 
     for (let index = 0; index < 4; index += 1) {
-      const duplicate = await handler(request(), "192.0.2.10");
+      const duplicate = await handler(request(cookie));
       expect(duplicate.status).toBe(202);
-      expect(await duplicate.json()).toEqual({ ok: true });
+      expect(await duplicate.json()).toEqual({ duplicate: true, ok: true });
+      expect(duplicate.headers.get("set-cookie")).toBeNull();
     }
 
-    expect((await handler(request(), "192.0.2.10")).status).toBe(429);
+    expect((await handler(request(cookie))).status).toBe(429);
   });
 
-  test("uses Bun's socket peer in the production server adapter", async () => {
-    const server = startServer({ ...config, port: 0 }, { waitlistStore: new MemoryWaitlistStore() });
+  test("keeps distinct clients independent without consulting Bun's proxy socket", async () => {
+    const server = startServer(
+      { ...config, port: 0 },
+      {
+        waitlistIdentitySecret: new Uint8Array(32).fill(8),
+        waitlistStore: new MemoryWaitlistStore(),
+      },
+    );
 
     try {
-      for (let index = 0; index < 5; index += 1) {
+      const first = await fetch(new URL("/api/waitlist", server.url), {
+        body: JSON.stringify({ email: "first@example.com" }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      const firstCookie = first.headers.get("set-cookie")?.split(";", 1)[0];
+      expect(first.status).toBe(202);
+      expect(firstCookie).toStartWith("medlock_waitlist_client=");
+
+      for (let index = 0; index < 4; index += 1) {
         const response = await fetch(new URL("/api/waitlist", server.url), {
-          body: JSON.stringify({ email: "person@example.com" }),
+          body: JSON.stringify({ email: "first@example.com" }),
           headers: {
+            Cookie: firstCookie!,
             "Content-Type": "application/json",
             "X-Forwarded-For": `203.0.113.${index}`,
           },
@@ -136,21 +160,32 @@ describe("server", () => {
         expect(response.status).toBe(202);
       }
 
-      const limited = await fetch(new URL("/api/waitlist", server.url), {
-        body: JSON.stringify({ email: "person@example.com" }),
+      expect(
+        (
+          await fetch(new URL("/api/waitlist", server.url), {
+            body: JSON.stringify({ email: "first@example.com" }),
+            headers: { Cookie: firstCookie!, "Content-Type": "application/json" },
+            method: "POST",
+          })
+        ).status,
+      ).toBe(429);
+
+      const independent = await fetch(new URL("/api/waitlist", server.url), {
+        body: JSON.stringify({ email: "second@example.com" }),
         headers: {
           "Content-Type": "application/json",
-          "X-Forwarded-For": "198.51.100.200",
+          "X-Forwarded-For": "203.0.113.0",
         },
         method: "POST",
       });
-      expect(limited.status).toBe(429);
+      expect(independent.status).toBe(202);
+      expect(independent.headers.get("set-cookie")).not.toBe(firstCookie);
     } finally {
       server.stop(true);
     }
   });
 
-  test("caps aggregate waitlist traffic even when peer buckets differ", async () => {
+  test("caps aggregate waitlist traffic even when client cookies differ", async () => {
     const handler = createHandler({ config, waitlistStore: new MemoryWaitlistStore() });
     const request = () =>
       new Request("http://localhost/api/waitlist", {
@@ -160,9 +195,9 @@ describe("server", () => {
       });
 
     for (let index = 0; index < 60; index += 1) {
-      expect((await handler(request(), `192.0.2.${index}`)).status).toBe(202);
+      expect((await handler(request())).status).toBe(202);
     }
-    expect((await handler(request(), "198.51.100.1")).status).toBe(429);
+    expect((await handler(request())).status).toBe(429);
   });
 
   test("applies the hardened response boundary to waitlist preflights", async () => {

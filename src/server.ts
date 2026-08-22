@@ -3,6 +3,10 @@ import { BUILT_PUBLIC_DIR, getRuntimeConfig, type RuntimeConfig } from "./config
 import { corsHeaders, json, shouldRedirectToCanonical, text, withSecurityHeaders, type JsonResponseOptions } from "./http.ts";
 import { createMcpEndpoint, type McpEndpoint } from "./mcp.ts";
 import { InMemoryRateLimiter } from "./rate-limit.ts";
+import {
+  createWaitlistIdentitySecret,
+  resolveWaitlistClient,
+} from "./waitlist-client.ts";
 import { createWaitlistStore, submitWaitlist, type WaitlistStore } from "./waitlist.ts";
 
 type ServerDependencies = {
@@ -10,6 +14,7 @@ type ServerDependencies = {
   readonly mcpEndpoint?: McpEndpoint;
   readonly now?: () => Date;
   readonly rateLimiter?: InMemoryRateLimiter;
+  readonly waitlistIdentitySecret?: Uint8Array;
   readonly waitlistStore?: WaitlistStore;
 };
 
@@ -26,17 +31,16 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
   ".svg": "image/svg+xml",
 };
 
-export function createHandler(
-  dependencies: ServerDependencies = {},
-): (request: Request, peerAddress?: unknown) => Promise<Response> {
+export function createHandler(dependencies: ServerDependencies = {}): (request: Request) => Promise<Response> {
   const config = dependencies.config ?? getRuntimeConfig();
   const waitlistStore = dependencies.waitlistStore ?? createWaitlistStore(config);
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
+  const waitlistIdentitySecret =
+    dependencies.waitlistIdentitySecret ?? createWaitlistIdentitySecret();
 
-  return async function handleRequest(request: Request, peerAddress?: unknown): Promise<Response> {
-    const effectivePeerAddress = typeof peerAddress === "string" && peerAddress ? peerAddress : "unknown";
+  return async function handleRequest(request: Request): Promise<Response> {
     const healthUrl = new URL(request.url);
     if (healthUrl.pathname === "/livez") {
       const deployment = Bun.env.PLATFORM_DEPLOY_NONCE;
@@ -52,7 +56,14 @@ export function createHandler(
 
     try {
       if (url.pathname === "/api/waitlist") {
-        return await handleWaitlist(request, effectivePeerAddress, config, waitlistStore, rateLimiter, now);
+        return await handleWaitlist(
+          request,
+          config,
+          waitlistStore,
+          rateLimiter,
+          waitlistIdentitySecret,
+          now,
+        );
       }
 
       if (url.pathname === "/api/mcp") {
@@ -86,8 +97,8 @@ export function startServer(
       console.error("server error", error instanceof Error ? error.name : "unknown error");
       return json({ error: "internal server error" }, { status: 500 });
     },
-    fetch(request, activeServer) {
-      return handler(request, activeServer.requestIP(request)?.address);
+    fetch(request) {
+      return handler(request);
     },
     hostname: "0.0.0.0",
     maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
@@ -103,10 +114,10 @@ if (import.meta.main) {
 
 async function handleWaitlist(
   request: Request,
-  peerAddress: string,
   config: RuntimeConfig,
   store: WaitlistStore,
   rateLimiter: InMemoryRateLimiter,
+  identitySecret: Uint8Array,
   now: () => Date,
 ): Promise<Response> {
   if (request.method === "OPTIONS") {
@@ -117,41 +128,43 @@ async function handleWaitlist(
     return apiJson({ error: "method not allowed" }, request, config, { headers: { Allow: "POST, OPTIONS" }, status: 405 });
   }
 
+  const client = resolveWaitlistClient(request, identitySecret);
+  const respond = (response: Response): Response => withWaitlistClientCookie(response, client.setCookie);
+
   const globalDecision = rateLimiter.check("waitlist:global", 60, 60_000);
   if (!globalDecision.allowed) {
-    return rateLimitedWaitlistResponse(request, config, globalDecision.retryAfterSeconds);
+    return respond(rateLimitedWaitlistResponse(request, config, globalDecision.retryAfterSeconds));
   }
 
-  const ipAddress = peerAddress;
-  const decision = rateLimiter.check(`waitlist:${ipAddress}`, 5, 60_000);
+  const decision = rateLimiter.check(`waitlist:${client.id}`, 5, 60_000);
   if (!decision.allowed) {
-    return rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+    return respond(rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds));
   }
 
   const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase();
   if (contentType !== "application/json") {
-    return apiJson({ error: "expected application/json" }, request, config, { status: 415 });
+    return respond(apiJson({ error: "expected application/json" }, request, config, { status: 415 }));
   }
 
   const parsedBody = await readBoundedJson(request, MAX_WAITLIST_BODY_SIZE);
   if (parsedBody.kind === "too-large") {
-    return apiJson({ error: "request body too large" }, request, config, { status: 413 });
+    return respond(apiJson({ error: "request body too large" }, request, config, { status: 413 }));
   }
 
   if (parsedBody.kind === "invalid") {
-    return apiJson({ error: "invalid JSON body" }, request, config, { status: 400 });
+    return respond(apiJson({ error: "invalid JSON body" }, request, config, { status: 400 }));
   }
 
   const body = parsedBody.value as { email?: unknown; source?: unknown } | undefined;
   if (!body || typeof body.email !== "string") {
-    return apiJson({ error: "email is required" }, request, config, { status: 400 });
+    return respond(apiJson({ error: "email is required" }, request, config, { status: 400 }));
   }
 
   const result = await submitWaitlist(
     store,
     {
       email: body.email,
-      ipAddress,
+      clientId: client.id,
       source: typeof body.source === "string" ? body.source : "site",
       userAgent: request.headers.get("user-agent") ?? undefined,
     },
@@ -159,10 +172,24 @@ async function handleWaitlist(
   );
 
   if (!result.ok) {
-    return apiJson({ error: result.error }, request, config, { status: result.status });
+    return respond(apiJson({ error: result.error }, request, config, { status: result.status }));
   }
 
-  return apiJson({ ok: true }, request, config, { status: 202 });
+  return respond(apiJson({ duplicate: result.duplicate, ok: true }, request, config, { status: 202 }));
+}
+
+function withWaitlistClientCookie(response: Response, setCookie: string | undefined): Response {
+  if (!setCookie) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", setCookie);
+  return new Response(response.body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
 }
 
 function rateLimitedWaitlistResponse(request: Request, config: RuntimeConfig, retryAfterSeconds = 60): Response {

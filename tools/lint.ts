@@ -18,6 +18,26 @@ await rejectExternalReferences("public/index.html", "https://medlock.ai/", "The 
 await rejectContains("public/assets/styles.css", "@import", "Styles should not import third-party design libraries.");
 await rejectContains("src/client.ts", "react", "The frontend should stay framework-free.");
 await rejectContains("src/server.ts", "wrangler", "Cloudflare/Wrangler runtime code should not remain.");
+await rejectContains(
+  "src/server.ts",
+  ".requestIP(",
+  "Cloud Run proxy sockets must not identify waitlist clients.",
+);
+await rejectContains(
+  "src/server.ts",
+  "x-forwarded-for",
+  "Caller-controlled forwarding headers must not identify waitlist clients.",
+);
+await requireContains(
+  "src/waitlist-client.ts",
+  "createHmac",
+  "Waitlist client cookies must be authenticated.",
+);
+await requireContains(
+  "src/waitlist-client.ts",
+  "timingSafeEqual",
+  "Waitlist cookie authentication must compare signatures in constant time.",
+);
 await rejectContains("package.json", "next", "Next.js should not remain in the pure Bun runtime.");
 
 await import("./verify-socket-config.ts");
