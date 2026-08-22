@@ -11,4 +11,4 @@ jobs:
   cleanup:
     permissions:
       id-token: write # Exchange only for the exact-SHA preview traffic operator.
-    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@b71154a7fefed354ba131e2d4ce79ea43b66a44e
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@d344f3835ca48f56c30a53641db8f3ea3a88ce53
