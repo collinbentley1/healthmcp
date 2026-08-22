@@ -7,7 +7,7 @@ const failures: string[] = [];
 await requireContains("Dockerfile", "dhi.io/bun", "Dockerfile must use Docker Hardened Bun images.");
 await requireContains(
   "Dockerfile",
-  "FROM oven/bun:1.4.0@sha256:",
+  "FROM oven/bun:1.4.0-alpine@sha256:",
   "Dockerfile must pin Bun 1.4.0 by digest.",
 );
 await requireContains("public/index.html", 'rel="icon"', "The document must link a favicon.");
