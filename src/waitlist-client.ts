@@ -31,11 +31,10 @@ export function resolveWaitlistClient(
 
   const id = randomBytes(18).toString("base64url");
   const value = `${id}.${sign(id, secret)}`;
-  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
 
   return {
     id,
-    setCookie: `${COOKIE_NAME}=${value}; Max-Age=${COOKIE_MAX_AGE_SECONDS}; Path=/api/waitlist; HttpOnly; SameSite=Strict${secure}`,
+    setCookie: `${COOKIE_NAME}=${value}; Max-Age=${COOKIE_MAX_AGE_SECONDS}; Path=/api/waitlist; HttpOnly; SameSite=Strict; Secure`,
   };
 }
 

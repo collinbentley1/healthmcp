@@ -49,6 +49,15 @@ describe("waitlist client identity", () => {
     }
   });
 
+  test("keeps the cookie Secure when TLS terminates before the Bun process", () => {
+    const minted = resolveWaitlistClient(
+      new Request("http://medlock-internal/api/waitlist"),
+      secret,
+    );
+
+    expect(minted.setCookie).toContain("; Secure");
+  });
+
   test("rejects undersized signing secrets", () => {
     expect(() =>
       resolveWaitlistClient(
