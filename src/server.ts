@@ -43,8 +43,13 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
   return async function handleRequest(request: Request): Promise<Response> {
     const healthUrl = new URL(request.url);
     if (healthUrl.pathname === "/livez") {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return text("method not allowed", { headers: { Allow: "GET, HEAD" }, status: 405 });
+      }
+
       const deployment = Bun.env.PLATFORM_DEPLOY_NONCE;
-      return json(deployment ? { ok: true, deployment } : { ok: true });
+      const response = json(deployment ? { ok: true, deployment } : { ok: true });
+      return request.method === "HEAD" ? withoutBody(response) : response;
     }
 
     const canonicalRedirect = shouldRedirectToCanonical(request, config);
@@ -70,11 +75,15 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
         return await mcpEndpoint.handle(request);
       }
 
-      if (url.pathname === "/scan") {
-        return await serveStatic("/scan.html", config);
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return text("method not allowed", { headers: { Allow: "GET, HEAD" }, status: 405 });
       }
 
-      return await serveStatic(url.pathname, config);
+      if (url.pathname === "/scan") {
+        return await serveStatic("/scan.html", config, request.method === "HEAD");
+      }
+
+      return await serveStatic(url.pathname, config, request.method === "HEAD");
     } catch (error) {
       console.error("request failed", error instanceof Error ? error.name : "unknown error");
       return url.pathname.startsWith("/api/")
@@ -216,7 +225,7 @@ function apiJson(body: unknown, request: Request, config: RuntimeConfig, options
   });
 }
 
-async function serveStatic(pathname: string, config: RuntimeConfig): Promise<Response> {
+async function serveStatic(pathname: string, config: RuntimeConfig, headOnly = false): Promise<Response> {
   let pathnameWithoutSlash: string;
   try {
     pathnameWithoutSlash = pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1));
@@ -243,13 +252,21 @@ async function serveStatic(pathname: string, config: RuntimeConfig): Promise<Res
   }
 
   return withSecurityHeaders(
-    new Response(file, {
+    new Response(headOnly ? null : file, {
       headers: {
         "Cache-Control": normalizedPath === "index.html" || normalizedPath === "scan.html" ? "no-cache" : "public, max-age=300",
         "Content-Type": CONTENT_TYPES[extname(filePath)] ?? "application/octet-stream",
       },
     }),
   );
+}
+
+function withoutBody(response: Response): Response {
+  return new Response(null, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
 }
 
 type BoundedJsonResult =

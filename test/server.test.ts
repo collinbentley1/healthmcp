@@ -36,6 +36,33 @@ describe("server", () => {
     expect(await response.json()).toEqual({ ok: true });
   });
 
+  test("limits liveness and static routes to safe read methods", async () => {
+    const handler = createHandler({ config });
+
+    for (const [method, path] of [
+      ["POST", "/"],
+      ["PUT", "/scan"],
+      ["DELETE", "/livez"],
+    ] as const) {
+      const response = await handler(new Request(`http://localhost${path}`, { method }));
+
+      expect(response.status).toBe(405);
+      expect(response.headers.get("Allow")).toBe("GET, HEAD");
+      expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(await response.text()).toBe("method not allowed");
+    }
+
+    const pageHead = await handler(new Request("http://localhost/", { method: "HEAD" }));
+    const liveHead = await handler(new Request("http://localhost/livez", { method: "HEAD" }));
+
+    expect(pageHead.status).toBe(200);
+    expect(pageHead.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+    expect(await pageHead.text()).toBe("");
+    expect(liveHead.status).toBe(200);
+    expect(liveHead.headers.get("Content-Type")).toContain("application/json");
+    expect(await liveHead.text()).toBe("");
+  });
+
   test("echoes the platform deployment nonce at /livez when configured", async () => {
     Bun.env.PLATFORM_DEPLOY_NONCE = "test-deployment-nonce";
 
