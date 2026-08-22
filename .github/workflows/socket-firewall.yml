@@ -14,4 +14,4 @@ jobs:
     name: Socket Firewall
     permissions:
       contents: read
-    uses: collinbentley1/platform/.github/workflows/socket-firewall.yml@6e619a0f4123fc594c8cb4d7d857ecbd1a8d5643
+    uses: collinbentley1/platform/.github/workflows/socket-firewall.yml@3da6111c3c515bc1c08ed2966c22d09785ce85e6
