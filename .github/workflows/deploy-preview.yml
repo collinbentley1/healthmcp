@@ -7,22 +7,36 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - converted_to_draft
 
-permissions:
-  contents: read
-  id-token: write
-  pull-requests: write
+permissions: {}
 
 jobs:
+  invalidate:
+    if: >-
+      github.event.action == 'synchronize' ||
+      github.event.action == 'converted_to_draft'
+    permissions:
+      id-token: write # Exchange only for the exact-SHA preview traffic operator.
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@09d037c012ae09c5a460d1ee52579eca9b101569
+
   deploy:
-    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@v0.4.0
-    with:
-      project-id: medlock-1025243085
-      region: us-east4
-      artifact-registry-repository: site
-      service-name: medlock
-      runtime-service-account: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
-      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      deploy-service-account: ${{ vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT }}
-      runtime-config-script: .github/platform/runtime-config.sh
-    secrets: inherit
+    needs: invalidate
+    if: >-
+      always() &&
+      (needs.invalidate.result == 'success' || needs.invalidate.result == 'skipped') &&
+      github.event.action != 'converted_to_draft'
+    permissions:
+      actions: read # Download the SBOM artifact produced by this workflow run.
+      attestations: write # Publish provenance and SBOM attestations for the copied digest.
+      contents: read
+      id-token: write # Exchange only through the exact reusable-workflow environment paths.
+      packages: write # Publish and remove only the isolated GHCR staging image.
+      pull-requests: write # Post the exact-head preview URL after deployment.
+    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@09d037c012ae09c5a460d1ee52579eca9b101569
+    secrets:
+      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}
+      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+      GRYPE_DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}
+      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}
+      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}

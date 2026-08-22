@@ -7,16 +7,16 @@ describe("waitlist", () => {
     const first = await submitWaitlist(
       store,
       {
+        clientId: "signed-client-one",
         email: "  Person@Example.COM ",
-        ipAddress: "203.0.113.10",
         source: "test",
         userAgent: "bun-test",
       },
       new Date("2026-06-01T12:00:00.000Z"),
     );
     const duplicate = await submitWaitlist(store, {
+      clientId: "signed-client-one",
       email: "person@example.com",
-      ipAddress: "203.0.113.10",
     });
 
     expect(first.ok).toBe(true);
@@ -30,8 +30,8 @@ describe("waitlist", () => {
 
   test("rejects invalid emails", async () => {
     const result = await submitWaitlist(new MemoryWaitlistStore(), {
+      clientId: "signed-client-two",
       email: "not-email",
-      ipAddress: "203.0.113.10",
     });
 
     expect(result.ok).toBe(false);
@@ -56,6 +56,11 @@ describe("waitlist", () => {
 
       if (init?.method === "POST") {
         expect(init.headers).toMatchObject({ Authorization: "Bearer token" });
+        const document = JSON.parse(String(init.body)) as {
+          fields?: Record<string, { stringValue?: string }>;
+        };
+        expect(document.fields?.clientHash?.stringValue).toMatch(/^[0-9a-f]{64}$/);
+        expect(document.fields?.ipHash).toBeUndefined();
         return Response.json({ name: "stored" });
       }
 
@@ -71,8 +76,8 @@ describe("waitlist", () => {
     const result = await submitWaitlist(
       store,
       {
+        clientId: "signed-firestore-client",
         email: "firestore@example.com",
-        ipAddress: "203.0.113.55",
       },
       new Date("2026-06-01T12:00:00.000Z"),
     );

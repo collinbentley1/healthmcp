@@ -1,2 +1,10 @@
+env = false
+telemetry = false
+
+[install]
+exact = true
+minimumReleaseAge = 604800
+registry = "https://registry.npmjs.org"
+
 [install.security]
-scanner = "@socketsecurity/bun-security-scanner"
+scanner = "./tools/socket-security-scanner.ts"
