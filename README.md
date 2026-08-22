@@ -145,16 +145,15 @@ The repository follows the shared platform contract:
 - `.github/workflows/deploy-preview.yml`: tagged pull request traffic on the single no-data `medlock-preview` service
 - `.github/workflows/reconcile-previews.yml`: exact-revision cleanup and reconciliation for shared preview traffic
 
-Every caller and Terraform mirror pins the same reviewed full platform SHA. Authenticated infrastructure work checks out only that platform commit and selects the immutable platform-owned deployment configuration by numeric GitHub repository ID; it never executes consumer HCL. Bootstrap, production, and public-exposure changes must run through the owner-controlled, review-gated pipeline against `platform/terraform/deployments`, not a manual apply from this repository. Until that pipeline and its state migration are complete, consumer Actions stay disabled. See the [pinned security rollout](https://github.com/collinbentley1/platform/blob/234fe5058348b7873476a8f6ce5a4ca966ea71d4/docs/security-rollout.md).
+Every caller and Terraform mirror pins the same reviewed full platform SHA. Authenticated infrastructure work checks out only that platform commit and selects the immutable platform-owned deployment configuration by numeric GitHub repository ID; it never executes consumer HCL. Bootstrap, production, and public-exposure changes must run through the owner-controlled, review-gated pipeline against `platform/terraform/deployments`, not a manual apply from this repository. Actions may be enabled only after that pipeline, its state migration, exact-SHA WIF, and SHA-only enforcement are verified. See the [pinned security rollout](https://github.com/collinbentley1/platform/blob/6e619a0f4123fc594c8cb4d7d857ecbd1a8d5643/docs/security-rollout.md).
 
 Do not define `GCP_*` repository variables or repository-level deploy secrets.
-Rotated `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, and `GRYPE_DB_MANIFEST_JSON` belong
-only to the owner-approved `preview-build` and `production-build` environments.
-The least-scope `SOCKET_API_TOKEN` is installed separately in `dependency-scan`
-and in both build environments because each performs an authenticated dependency
-install. Publish, cloud-deploy, preview-operations, and supply-chain environments
-are otherwise secretless for Medlock. Runtime configuration, including the
-production Firestore backend and memory-only preview mode, is selected in
-reviewed platform code rather than repository variables.
+Rotated `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, `GRYPE_DB_MANIFEST_JSON`, and the
+least-scope `SOCKET_API_TOKEN` belong only to the owner-approved `preview-build`
+and `production-build` environments. The platform repository alone owns the
+trusted-main `dependency-scan` token. Publish, cloud-deploy, preview-operations,
+and supply-chain environments are otherwise secretless for Medlock. Runtime
+configuration, including the production Firestore backend and memory-only preview
+mode, is selected in reviewed platform code rather than repository variables.
 
 Build, Artifact Registry publication, Cloud Run deployment, preview operations, and supply-chain attestation use separate protected environments and least-scope identities. External-fork and Dependabot pull requests receive neither those environment secrets nor a cloud preview.
