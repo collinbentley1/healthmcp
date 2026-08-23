@@ -17,4 +17,4 @@ jobs:
     permissions:
       id-token: write # Exchange only for the exact-SHA preview traffic operator.
       pull-requests: read # Compare live tags with authoritative pull-request heads.
-    uses: collinbentley1/platform/.github/workflows/reconcile-previews.yml@ddaa918319be123c780876d510efb4715c1f879d
+    uses: collinbentley1/platform/.github/workflows/reconcile-previews.yml@89fba35d42ebdde48539ecc8b7b6728ea59f88ff

@@ -15,4 +15,4 @@ jobs:
     permissions:
       checks: read # Verify the exact successful checks from Socket App 156372.
       contents: read
-    uses: collinbentley1/platform/.github/workflows/socket-firewall.yml@ddaa918319be123c780876d510efb4715c1f879d
+    uses: collinbentley1/platform/.github/workflows/socket-firewall.yml@89fba35d42ebdde48539ecc8b7b6728ea59f88ff
