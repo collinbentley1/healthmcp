@@ -14,4 +14,4 @@ jobs:
     permissions:
       id-token: write # Exchange only for the exact-SHA preview traffic operator.
       pull-requests: read # Let the reusable cleanup re-read current lifecycle state.
-    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@c8412165029d60b61bb719f07ae846181646f194
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@ebdc8e84e1a563db09cc8a953e90f82cdc4c1de9

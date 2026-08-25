@@ -12,7 +12,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # Prove exact-SHA WIF and read cloud metadata for convergence only.
-    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@c8412165029d60b61bb719f07ae846181646f194
+    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@ebdc8e84e1a563db09cc8a953e90f82cdc4c1de9
 
   deploy:
     needs: infrastructure
@@ -21,4 +21,4 @@ jobs:
       attestations: write # Publish provenance and SBOM attestations for the copied digest.
       contents: read
       id-token: write # Exchange only through exact production publish and deploy paths.
-    uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@c8412165029d60b61bb719f07ae846181646f194
+    uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@ebdc8e84e1a563db09cc8a953e90f82cdc4c1de9
