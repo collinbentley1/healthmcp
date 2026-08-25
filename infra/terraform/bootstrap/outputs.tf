@@ -33,6 +33,16 @@ output "preview_deploy_service_account_email" {
   value       = module.bootstrap.preview_deploy_service_account_email
 }
 
+output "preview_commit_service_account_email" {
+  description = "Exact-workflow transaction identity scoped to preview traffic and exposure changes only."
+  value       = module.bootstrap.preview_commit_service_account_email
+}
+
+output "preview_iam_audit_service_account_email" {
+  description = "Exact-workflow, read-only cross-project preview runtime IAM auditor."
+  value       = module.bootstrap.preview_iam_audit_service_account_email
+}
+
 output "preview_operator_service_account_email" {
   description = "Retired transition-only preview operator service account; receives no steady-state operational grants."
   value       = module.bootstrap.preview_operator_service_account_email
@@ -41,6 +51,11 @@ output "preview_operator_service_account_email" {
 output "preview_publisher_service_account_email" {
   description = "Artifact Registry-only service account used by the preview publish job."
   value       = module.bootstrap.preview_publisher_service_account_email
+}
+
+output "deployment_parity_reader_service_account_email" {
+  description = "Read-only identity used by exact deployment workflows for DHI parity checks."
+  value       = module.bootstrap.deployment_parity_reader_service_account_email
 }
 
 output "runtime_service_account_email" {

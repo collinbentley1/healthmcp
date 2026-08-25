@@ -1,5 +1,5 @@
 module "bootstrap" {
-  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=ddaa918319be123c780876d510efb4715c1f879d"
+  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=87de70d83f389df661eaa7f3b8a4faa049f59f09"
 
   app                         = "medlock"
   project_id                  = var.project_id
@@ -12,14 +12,15 @@ module "bootstrap" {
   github_owner_id             = var.github_owner_id
   github_repository_id        = var.github_repository_id
   trusted_platform_workflow_shas = [
-    "ddaa918319be123c780876d510efb4715c1f879d",
+    "87de70d83f389df661eaa7f3b8a4faa049f59f09",
   ]
   preview_operations_active_workflow_shas = [
-    "ddaa918319be123c780876d510efb4715c1f879d",
+    "87de70d83f389df661eaa7f3b8a4faa049f59f09",
   ]
   preview_operator_transition_workflow_shas = []
   required_services = [
     "artifactregistry.googleapis.com",
+    "cloudasset.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "firestore.googleapis.com",
     "iam.googleapis.com",
