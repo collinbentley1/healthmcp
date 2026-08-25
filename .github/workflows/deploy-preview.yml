@@ -21,7 +21,7 @@ jobs:
     permissions:
       id-token: write # Exchange only for the exact-SHA preview traffic operator.
       pull-requests: read # Let the reusable cleanup re-read current lifecycle state.
-    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@89fba35d42ebdde48539ecc8b7b6728ea59f88ff
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@87de70d83f389df661eaa7f3b8a4faa049f59f09
 
   deploy:
     needs: invalidate
@@ -36,4 +36,4 @@ jobs:
       contents: read
       id-token: write # Exchange only through the exact reusable-workflow environment paths.
       pull-requests: write # Post the exact-head preview URL after deployment.
-    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@89fba35d42ebdde48539ecc8b7b6728ea59f88ff
+    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@87de70d83f389df661eaa7f3b8a4faa049f59f09
