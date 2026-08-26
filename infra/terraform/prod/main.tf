@@ -1,5 +1,5 @@
 module "site" {
-  source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=81213a156b03794a31eb8a34372b4798709e288f"
+  source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=2051ad813caf41e205203d07190feb3012fa2667"
 
   providers = {
     google                = google
