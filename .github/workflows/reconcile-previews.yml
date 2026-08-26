@@ -1,0 +1,20 @@
+name: Reconcile previews
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # Reconcile hourly even though mutation jobs use the bounded FIFO queue;
+    # this is the durable backstop for interrupted or externally drifted runs.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  reconcile:
+    permissions:
+      id-token: write # Exchange only for the exact-SHA preview traffic operator.
+      pull-requests: read # Compare live tags with authoritative pull-request heads.
+    uses: collinbentley1/platform/.github/workflows/reconcile-previews.yml@3ce4e9ea52d5e420b5487591f4514cc28d5ab21a

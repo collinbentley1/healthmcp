@@ -1,8 +1,8 @@
 {
   "name": "medlock",
   "projectId": "medlock-1025243085",
+  "githubRepositoryId": "1025243085",
   "region": "us-east4",
   "serviceName": "medlock",
-  "artifactRegistryRepository": "site",
-  "runtimeConfigScript": ".github/platform/runtime-config.sh"
+  "artifactRegistryRepository": "site"
 }

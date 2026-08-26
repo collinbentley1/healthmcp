@@ -1,28 +1,39 @@
 name: Deploy preview
 
 on:
-  pull_request:
+  pull_request_target:
+    branches:
+      - main
     types:
       - opened
       - synchronize
       - reopened
       - ready_for_review
+      - converted_to_draft
 
-permissions:
-  contents: read
-  id-token: write
-  pull-requests: write
+permissions: {}
 
 jobs:
+  invalidate:
+    if: >-
+      github.event.action == 'synchronize' ||
+      github.event.action == 'converted_to_draft'
+    permissions:
+      id-token: write # Exchange only for the exact-SHA preview traffic operator.
+      pull-requests: read # Let the reusable cleanup re-read current lifecycle state.
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@3ce4e9ea52d5e420b5487591f4514cc28d5ab21a
+
   deploy:
-    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@v0.4.0
-    with:
-      project-id: medlock-1025243085
-      region: us-east4
-      artifact-registry-repository: site
-      service-name: medlock
-      runtime-service-account: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
-      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      deploy-service-account: ${{ vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT }}
-      runtime-config-script: .github/platform/runtime-config.sh
-    secrets: inherit
+    needs: invalidate
+    if: >-
+      always() &&
+      (needs.invalidate.result == 'success' || needs.invalidate.result == 'skipped') &&
+      github.event.action != 'converted_to_draft' &&
+      github.event.pull_request.draft == false
+    permissions:
+      actions: read # Download the SBOM artifact produced by this workflow run.
+      attestations: write # Publish provenance and SBOM attestations for the copied digest.
+      contents: read
+      id-token: write # Exchange only through the exact reusable-workflow environment paths.
+      pull-requests: write # Post the exact-head preview URL after deployment.
+    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@3ce4e9ea52d5e420b5487591f4514cc28d5ab21a
