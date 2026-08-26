@@ -1,104 +1,3 @@
-variable "allowed_hosts" {
-  description = "Hostnames accepted by the MCP endpoint."
-  type        = list(string)
-  default = [
-    "medlock.ai",
-    "www.medlock.ai",
-    "mcp.medlock.ai",
-    "healthmcp.ai",
-    "www.healthmcp.ai",
-    "healthmcp.app",
-    "www.healthmcp.app",
-    "*.run.app",
-  ]
-}
-
-variable "allowed_origins" {
-  description = "Browser origins accepted by the MCP and waitlist endpoints."
-  type        = list(string)
-  default = [
-    "https://medlock.ai",
-    "https://www.medlock.ai",
-    "https://mcp.medlock.ai",
-    "https://chat.openai.com",
-    "https://claude.ai",
-    "https://*.run.app",
-  ]
-}
-
-variable "app_version" {
-  description = "Application version value passed to the runtime."
-  type        = string
-  default     = "0.2.0"
-}
-
-variable "artifact_registry_repository_id" {
-  description = "Artifact Registry Docker repository ID."
-  type        = string
-  default     = "site"
-}
-
-variable "bootstrap_image" {
-  description = "Initial public image used before the application container exists."
-  type        = string
-  default     = "us-docker.pkg.dev/cloudrun/container/hello"
-}
-
-variable "canonical_host" {
-  description = "Canonical site hostname."
-  type        = string
-  default     = "medlock.ai"
-}
-
-variable "custom_domains" {
-  description = "Cloud Run custom domains mapped to the production service."
-  type        = list(string)
-  default = [
-    "medlock.ai",
-    "www.medlock.ai",
-    "mcp.medlock.ai",
-    "healthmcp.ai",
-    "www.healthmcp.ai",
-    "healthmcp.app",
-    "www.healthmcp.app",
-  ]
-}
-
-variable "firestore_database_id" {
-  description = "Firestore database ID used for waitlist records."
-  type        = string
-  default     = "(default)"
-}
-
-variable "firestore_location_id" {
-  description = "Firestore location ID."
-  type        = string
-  default     = "nam5"
-}
-
-variable "legacy_hosts" {
-  description = "Hosts redirected by the app to canonical_host."
-  type        = list(string)
-  default = [
-    "healthmcp.ai",
-    "www.healthmcp.ai",
-    "healthmcp.app",
-    "www.healthmcp.app",
-  ]
-}
-
-variable "preview_deploy_service_account_email" {
-  description = "Preview deploy service account email."
-  type        = string
-  default     = "gha-preview-deploy@medlock-1025243085.iam.gserviceaccount.com"
-}
-
-variable "prod_deploy_service_account_email" {
-  description = "Production deploy service account email."
-  type        = string
-  default     = "gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
-}
-
 variable "project_id" {
   description = "Google Cloud project ID."
   type        = string
@@ -111,20 +10,128 @@ variable "region" {
   default     = "us-east4"
 }
 
-variable "runtime_service_account_email" {
-  description = "Cloud Run runtime service account email."
-  type        = string
-  default     = "cloud-run-runtime@medlock-1025243085.iam.gserviceaccount.com"
-}
-
 variable "service_name" {
   description = "Production Cloud Run service name."
   type        = string
   default     = "medlock"
 }
 
-variable "waitlist_collection" {
-  description = "Firestore collection used for production waitlist records."
+variable "artifact_registry_repository_id" {
+  description = "Artifact Registry Docker repository ID."
   type        = string
-  default     = "waitlist"
+  default     = "site"
+}
+
+variable "bootstrap_image" {
+  description = "Digest-pinned initial public image used before the application container exists."
+  type        = string
+  default     = "us-docker.pkg.dev/cloudrun/container/hello@sha256:9a0e9a5c7a19281e7617991d2fc61809de4973e6e75a10b2f07df3719ffda33c"
+}
+
+variable "bootstrap_runtime_service_account_email" {
+  description = "No-role service account used only by the initial bootstrap image."
+  type        = string
+  default     = "cloud-run-bootstrap@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "runtime_service_account_email" {
+  description = "Cloud Run runtime service account email."
+  type        = string
+  default     = "cloud-run-runtime@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "preview_runtime_service_account_email" {
+  description = "No-data Cloud Run preview runtime service account email."
+  type        = string
+  default     = "cloud-run-preview@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "preview_ingress" {
+  description = "Ingress policy for the shared preview Cloud Run service."
+  type        = string
+  default     = "INGRESS_TRAFFIC_ALL"
+
+  validation {
+    condition = contains([
+      "INGRESS_TRAFFIC_ALL",
+      "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+    ], var.preview_ingress)
+    error_message = "preview_ingress must allow all traffic or only internal and Cloud Load Balancing traffic."
+  }
+}
+
+variable "prod_deploy_service_account_email" {
+  description = "Production deploy service account email with exact-repository read access and only declared exact-secret version-add grants."
+  type        = string
+  default     = "gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "prod_publisher_service_account_email" {
+  description = "Artifact Registry-only production publisher service account email."
+  type        = string
+  default     = "gha-prod-publish@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "deployment_parity_reader_service_account_email" {
+  description = "Read-only deployment parity service account email."
+  type        = string
+  default     = "gha-deploy-parity@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "preview_deploy_service_account_email" {
+  description = "Preview deploy service account email with exact-repository read access."
+  type        = string
+  default     = "gha-preview-deploy@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "preview_commit_service_account_email" {
+  description = "Preview traffic/exposure transaction service account email."
+  type        = string
+  default     = "gha-preview-commit@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "preview_operator_service_account_email" {
+  description = "Deprecated transition-only preview operator email retained for input compatibility; receives no IAM grant."
+  type        = string
+  default     = "gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "preview_publisher_service_account_email" {
+  description = "Artifact Registry-only preview publisher service account email."
+  type        = string
+  default     = "gha-preview-publish@medlock-1025243085.iam.gserviceaccount.com"
+}
+
+variable "runtime_secret_ids" {
+  description = "Secret Manager secret containers retained by the platform; does not grant runtime access."
+  type        = set(string)
+  default = [
+    "waitlist-identity-keyset",
+  ]
+}
+
+variable "runtime_secret_accessor_ids" {
+  description = "Declared runtime secret IDs whose payloads the production runtime may read."
+  type        = set(string)
+  default = [
+    "waitlist-identity-keyset",
+  ]
+
+  validation {
+    condition     = length(setsubtract(var.runtime_secret_accessor_ids, var.runtime_secret_ids)) == 0
+    error_message = "runtime_secret_accessor_ids must be a subset of runtime_secret_ids."
+  }
+}
+
+variable "runtime_secret_version_adder_ids" {
+  description = "Declared runtime secret IDs to which the production deploy identity may add immutable versions."
+  type        = set(string)
+  default = [
+    "waitlist-identity-keyset",
+  ]
+
+  validation {
+    condition     = length(setsubtract(var.runtime_secret_version_adder_ids, var.runtime_secret_ids)) == 0
+    error_message = "runtime_secret_version_adder_ids must be a subset of runtime_secret_ids."
+  }
 }

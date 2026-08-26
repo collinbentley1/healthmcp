@@ -2,17 +2,21 @@ name: Socket Firewall
 
 on:
   pull_request:
+    types:
+      - edited
+      - opened
+      - reopened
+      - synchronize
   push:
     branches:
       - main
-  workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   firewall:
     name: Socket Firewall
-    uses: collinbentley1/platform/.github/workflows/socket-firewall.yml@v0.4.0
-    with:
-      bun-version: 1.4.0
+    permissions:
+      checks: read # Verify the exact successful checks from Socket App 156372.
+      contents: read
+    uses: collinbentley1/platform/.github/workflows/socket-firewall.yml@0a4a52f94e7795fc42e54f1d4d304e052c33ca82

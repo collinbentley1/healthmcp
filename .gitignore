@@ -3,9 +3,34 @@
 .env
 .env.*
 !.env.example
-.terraform/
 coverage/
 dist/
 node_modules/
 outputs/
 work/
+
+# BEGIN platform-managed Terraform safety rules
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+*.plan
+*.plan.*
+*.tflock
+*.tflock.*
+*.tfvars
+*.tfvars.*
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl.tmp
+# END platform-managed Terraform safety rules
