@@ -2,18 +2,20 @@ name: Application
 
 on:
   pull_request:
+    types:
+      - edited
+      - opened
+      - reopened
+      - synchronize
   push:
     branches:
       - main
-  workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   verify:
     name: Bun verify
-    uses: collinbentley1/platform/.github/workflows/application.yml@v0.4.0
-    with:
-      bun-version: 1.4.0
-      verify-command: bun run verify
+    permissions:
+      contents: read
+    uses: collinbentley1/platform/.github/workflows/application.yml@81213a156b03794a31eb8a34372b4798709e288f

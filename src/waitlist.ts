@@ -4,10 +4,10 @@ import { dirname, join } from "node:path";
 import type { RuntimeConfig } from "./config.ts";
 
 export type WaitlistEntry = {
+  readonly clientHash: string;
   readonly createdAt: string;
   readonly email: string;
   readonly emailHash: string;
-  readonly ipHash: string;
   readonly source: string;
   readonly userAgentHash: string;
 };
@@ -20,8 +20,8 @@ export type WaitlistStore = {
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export type WaitlistSubmission = {
+  readonly clientId: string;
   readonly email: string;
-  readonly ipAddress: string;
   readonly source?: string | undefined;
   readonly userAgent?: string | undefined;
 };
@@ -46,10 +46,10 @@ export async function submitWaitlist(store: WaitlistStore, submission: WaitlistS
   }
 
   const entry: WaitlistEntry = {
+    clientHash: sha256(submission.clientId || "unknown"),
     createdAt: now.toISOString(),
     email,
     emailHash,
-    ipHash: sha256(submission.ipAddress || "unknown"),
     source: sanitizeSource(submission.source),
     userAgentHash: sha256(submission.userAgent || "unknown"),
   };
@@ -80,7 +80,13 @@ export class FileWaitlistStore implements WaitlistStore {
   async get(emailHash: string): Promise<WaitlistEntry | undefined> {
     const filePath = this.#filePath(emailHash);
     try {
-      return JSON.parse(await readFile(filePath, "utf8")) as WaitlistEntry;
+      const entry = JSON.parse(await readFile(filePath, "utf8")) as WaitlistEntry & {
+        readonly ipHash?: string;
+      };
+      return {
+        ...entry,
+        clientHash: entry.clientHash || entry.ipHash || "",
+      };
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return undefined;
@@ -240,9 +246,9 @@ function toFirestoreDocument(entry: WaitlistEntry): FirestoreDocument {
   return {
     fields: {
       createdAt: { timestampValue: entry.createdAt },
+      clientHash: { stringValue: entry.clientHash },
       email: { stringValue: entry.email },
       emailHash: { stringValue: entry.emailHash },
-      ipHash: { stringValue: entry.ipHash },
       source: { stringValue: entry.source },
       userAgentHash: { stringValue: entry.userAgentHash },
     },
@@ -253,10 +259,10 @@ function fromFirestoreDocument(document: FirestoreDocument): WaitlistEntry {
   const fields = document.fields ?? {};
 
   return {
+    clientHash: readString(fields.clientHash) || readString(fields.ipHash),
     createdAt: readString(fields.createdAt),
     email: readString(fields.email),
     emailHash: readString(fields.emailHash),
-    ipHash: readString(fields.ipHash),
     source: readString(fields.source),
     userAgentHash: readString(fields.userAgentHash),
   };
