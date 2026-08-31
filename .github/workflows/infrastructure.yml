@@ -2,19 +2,17 @@ name: Infrastructure
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+    types:
+      - edited
+      - opened
+      - reopened
+      - synchronize
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
   infrastructure:
-    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@v0.4.0
-    with:
-      project-id: medlock-1025243085
-      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      terraform-service-account: ${{ vars.GCP_TERRAFORM_SERVICE_ACCOUNT }}
+    permissions:
+      contents: read
+      id-token: write # Permission ceiling for the main-only convergence job in the trusted reusable workflow.
+    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@e9babc092fa18fea4ca8028a59355d037c03a651

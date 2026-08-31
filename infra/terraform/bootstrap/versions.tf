@@ -2,7 +2,7 @@ terraform {
   required_version = "~> 1.14.0"
 
   backend "gcs" {
-    bucket = "medlock-tfstate-1025243085"
+    bucket = "medlock-tfstate-1025243085-bootstrap"
     prefix = "medlock/bootstrap"
   }
 

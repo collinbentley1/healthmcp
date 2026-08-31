@@ -1,5 +1,6 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { AuthInfo, CallToolResult } from "@modelcontextprotocol/server";
-import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import type { RuntimeConfig } from "./config.ts";
 import { isTrustedHost, isTrustedOrigin, json, withCors } from "./http.ts";
@@ -10,6 +11,7 @@ export type McpEndpoint = {
 };
 
 const vitalTypeSchema = z.enum(VITAL_TYPES);
+const MAX_MCP_BODY_SIZE = 65_536;
 const dateRangeSchema = z
   .object({
     end: z.string().datetime().optional().describe("Inclusive ISO 8601 end timestamp."),
@@ -50,6 +52,68 @@ type FetchVitalsOutput = z.infer<typeof fetchVitalsOutputSchema>;
 type ScanOutput = z.infer<typeof scanOutputSchema>;
 
 export function createMcpEndpoint(config: RuntimeConfig): McpEndpoint {
+  const handler = createMcpHandler(() => createMedlockMcpServer(config), {
+    onerror: (error) => console.error("mcp request failed", error.name),
+  });
+
+  return {
+    async handle(request: Request): Promise<Response> {
+      if (!isTrustedHost(request, config)) {
+        return withCors(json({ error: "untrusted host" }, { status: 403 }), request, config);
+      }
+
+      if (!isTrustedOrigin(request, config)) {
+        return withCors(json({ error: "untrusted origin" }, { status: 403 }), request, config);
+      }
+
+      if (request.method === "OPTIONS") {
+        return withCors(new Response(null, { status: 204 }), request, config);
+      }
+
+      if (request.method !== "POST") {
+        return withCors(
+          json({ error: "method not allowed" }, { headers: { Allow: "POST, OPTIONS" }, status: 405 }),
+          request,
+          config,
+        );
+      }
+
+      const mediaType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase();
+      if (mediaType !== "application/json") {
+        return withCors(json({ error: "expected application/json" }, { status: 415 }), request, config);
+      }
+
+      const authInfo = authenticate(request, config);
+      if (!authInfo) {
+        return withCors(
+          json(
+            { error: "missing or invalid bearer token" },
+            { headers: { "WWW-Authenticate": 'Bearer realm="medlock-mcp"' }, status: 401 },
+          ),
+          request,
+          config,
+        );
+      }
+
+      const parsedBody = await readBoundedJson(request, MAX_MCP_BODY_SIZE);
+      if (parsedBody.kind === "too-large") {
+        return withCors(json({ error: "request body too large" }, { status: 413 }), request, config);
+      }
+
+      if (parsedBody.kind === "invalid") {
+        return withCors(json({ error: "invalid JSON body" }, { status: 400 }), request, config);
+      }
+
+      if (Array.isArray(parsedBody.value)) {
+        return withCors(json({ error: "JSON-RPC batches are not supported" }, { status: 400 }), request, config);
+      }
+
+      return withCors(await handler.fetch(request, { authInfo, parsedBody: parsedBody.value }), request, config);
+    },
+  };
+}
+
+function createMedlockMcpServer(config: RuntimeConfig): McpServer {
   const server = new McpServer(
     {
       name: "medlock",
@@ -63,34 +127,7 @@ export function createMcpEndpoint(config: RuntimeConfig): McpEndpoint {
   );
 
   registerMedlockTools(server, config);
-
-  const transport = new WebStandardStreamableHTTPServerTransport();
-  transport.onerror = (error) => console.error("mcp transport error", error);
-  const ready = server.connect(transport);
-
-  return {
-    async handle(request: Request): Promise<Response> {
-      if (request.method === "OPTIONS") {
-        return withCors(new Response(null, { status: 204 }), request, config);
-      }
-
-      if (!isTrustedHost(request, config)) {
-        return withCors(json({ error: "untrusted host" }, { status: 403 }), request, config);
-      }
-
-      if (!isTrustedOrigin(request, config)) {
-        return withCors(json({ error: "untrusted origin" }, { status: 403 }), request, config);
-      }
-
-      const authInfo = authenticate(request, config);
-      if (!authInfo) {
-        return withCors(json({ error: "missing or invalid bearer token" }, { status: 401 }), request, config);
-      }
-
-      await ready;
-      return withCors(await transport.handleRequest(request, { authInfo }), request, config);
-    },
-  };
+  return server;
 }
 
 function registerMedlockTools(server: McpServer, config: RuntimeConfig): void {
@@ -210,10 +247,10 @@ function authenticate(request: Request, config: RuntimeConfig): AuthInfo | undef
     };
   }
 
-  const authorization = request.headers.get("authorization")?.trim();
-  const expected = `Bearer ${config.mcpBearerToken}`;
+  const authorization = request.headers.get("authorization")?.trim() ?? "";
+  const suppliedToken = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
 
-  if (authorization !== expected) {
+  if (!tokensEqual(suppliedToken, config.mcpBearerToken)) {
     return undefined;
   }
 
@@ -222,4 +259,60 @@ function authenticate(request: Request, config: RuntimeConfig): AuthInfo | undef
     scopes: ["pod:read", "scan:prepare"],
     token: config.mcpBearerToken,
   };
+}
+
+function tokensEqual(left: string, right: string): boolean {
+  const leftHash = createHash("sha256").update(left).digest();
+  const rightHash = createHash("sha256").update(right).digest();
+  return timingSafeEqual(leftHash, rightHash);
+}
+
+type BoundedJsonResult =
+  | { readonly kind: "invalid" }
+  | { readonly kind: "ok"; readonly value: unknown }
+  | { readonly kind: "too-large" };
+
+async function readBoundedJson(request: Request, maxBytes: number): Promise<BoundedJsonResult> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0) {
+      return { kind: "invalid" };
+    }
+    if (declaredBytes > maxBytes) {
+      return { kind: "too-large" };
+    }
+  }
+
+  if (!request.body) {
+    return { kind: "invalid" };
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { kind: "too-large" };
+      }
+      chunks.push(value);
+    }
+
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { kind: "ok", value: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) };
+  } catch {
+    return { kind: "invalid" };
+  }
 }
