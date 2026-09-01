@@ -14,6 +14,7 @@ import {
   type QuotaRule,
   type WaitlistQuota,
 } from "./waitlist-quota.ts";
+import { IdentityTokenVerifier } from "./identity-token.ts";
 import { createWaitlistStore, normalizeEmail, sha256, submitWaitlist, type WaitlistStore } from "./waitlist.ts";
 
 type ServerDependencies = {
@@ -26,6 +27,7 @@ type ServerDependencies = {
   readonly waitlistStore?: WaitlistStore;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly monotonicNow?: () => number;
+  readonly identityVerifier?: { verify: IdentityTokenVerifier["verify"] };
 };
 
 export const MAX_REQUEST_BODY_SIZE = 1_048_576;
@@ -94,6 +96,13 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
   const sleep = dependencies.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
+  // Absent audience means the ownership flow is not provisioned. Activation
+  // then refuses outright rather than constructing a verifier that would trust
+  // an audience nobody configured.
+  const identityVerifier = dependencies.identityVerifier ??
+    (config.identityPlatformAudience === undefined
+      ? undefined
+      : new IdentityTokenVerifier({ audience: config.identityPlatformAudience }));
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
@@ -139,6 +148,18 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           now,
           sleep,
           monotonicNow,
+        );
+      }
+
+      if (url.pathname === "/api/waitlist/activate") {
+        return await handleWaitlistActivation(
+          request,
+          config,
+          waitlistStore,
+          waitlistQuota,
+          identityVerifier,
+          waitlistIdentitySecrets,
+          now,
         );
       }
 
@@ -342,6 +363,112 @@ async function handleWaitlist(
   // enumeration oracle, whether it is published as a body field, a status code,
   // a header, or a message on the page.
   return await settle(apiJson({ ok: true }, request, config, { status: 202 }));
+}
+
+// Activation: the second half of the ownership flow.
+//
+// It accepts a token and nothing else. There is no browser API key anywhere in
+// this design, so there is no client-callable Identity Platform surface to
+// bypass the quota with -- the only way to reach a mailbox is through the
+// backend dispatch, behind the same shared budget.
+async function handleWaitlistActivation(
+  request: Request,
+  config: RuntimeConfig,
+  store: WaitlistStore,
+  quota: WaitlistQuota,
+  verifier: { verify: IdentityTokenVerifier["verify"] } | undefined,
+  identitySecrets: readonly Uint8Array[],
+  now: () => Date,
+): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return withSecurityHeaders(
+      new Response(null, { headers: corsHeaders(request, config), status: 204 }),
+    );
+  }
+  if (request.method !== "POST") {
+    return apiJson({ error: "method not allowed" }, request, config, {
+      headers: { Allow: "POST, OPTIONS" },
+      status: 405,
+    });
+  }
+  if (verifier === undefined) {
+    // Fail closed: no audience configured means no token can be trusted, and
+    // an activation that cannot verify must not activate.
+    return apiJson({ error: "waitlist activation is not available" }, request, config, {
+      status: 503,
+    });
+  }
+
+  const client = resolveWaitlistClient(request, identitySecrets);
+  // Activation spends the shared budget too. Otherwise it would be an
+  // unmetered oracle for guessing tokens.
+  let decision;
+  try {
+    decision = await quota.consume([
+      {
+        key: "waitlist:global",
+        limit: WAITLIST_QUOTA_LIMITS.global.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+      },
+      client.authenticated
+        ? {
+          key: `waitlist:client:${client.id.toLowerCase()}`,
+          limit: WAITLIST_QUOTA_LIMITS.client.limit,
+          windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+        }
+        : {
+          key: "waitlist:unestablished",
+          limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+          windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
+        },
+    ], now());
+  } catch (error) {
+    console.error("waitlist quota unavailable", error instanceof Error ? error.name : "unknown");
+    return apiJson({ error: "waitlist temporarily unavailable" }, request, config, {
+      headers: { "Retry-After": "60" },
+      status: 503,
+    });
+  }
+  if (!decision.allowed) {
+    return rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+  }
+
+  const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim()
+    .toLowerCase();
+  if (contentType !== "application/json") {
+    return apiJson({ error: "expected application/json" }, request, config, { status: 415 });
+  }
+  const parsed = await readBoundedJson(request, MAX_WAITLIST_BODY_SIZE);
+  if (parsed.kind === "too-large") {
+    return apiJson({ error: "request body too large" }, request, config, { status: 413 });
+  }
+  if (parsed.kind !== "ok") {
+    return apiJson({ error: "invalid JSON body" }, request, config, { status: 400 });
+  }
+  const body = parsed.value as { idToken?: unknown } | undefined;
+  if (!body || typeof body.idToken !== "string") {
+    return apiJson({ error: "idToken is required" }, request, config, { status: 400 });
+  }
+
+  const nowMs = now().getTime();
+  let identity;
+  try {
+    identity = await verifier.verify(body.idToken, nowMs);
+  } catch {
+    // Deliberately uniform: which check refused the token is not the caller's
+    // business, and naming it would help an attacker shape the next one.
+    return apiJson({ error: "activation could not be verified" }, request, config, { status: 401 });
+  }
+
+  const outcome = await store.confirm(sha256(identity.email), identity.subject, nowMs);
+  if (outcome === "absent" || outcome === "expired") {
+    // Same answer for both: whether an address was ever submitted, and whether
+    // its pending window lapsed, are membership facts.
+    return apiJson({ error: "activation could not be verified" }, request, config, { status: 401 });
+  }
+  // "confirmed" and "already-confirmed" are the same to a caller: a replayed
+  // token must not be distinguishable from a first use.
+  return apiJson({ ok: true }, request, config, { status: 200 });
 }
 
 function withWaitlistClientCookie(response: Response, setCookie: string | undefined): Response {

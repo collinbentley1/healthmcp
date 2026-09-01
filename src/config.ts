@@ -10,6 +10,10 @@ export type RuntimeConfig = {
   readonly firestoreCollection: string;
   readonly firestoreDatabaseId: string;
   readonly firestoreProjectId: string | undefined;
+  // The Identity Platform project whose tokens this service will accept. Unset
+  // means the ownership flow is not provisioned, and activation refuses rather
+  // than guessing at an audience.
+  readonly identityPlatformAudience: string | undefined;
   readonly legacyHosts: readonly string[];
   readonly mcpBearerToken: string | undefined;
   readonly port: number;
@@ -68,6 +72,7 @@ export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.e
     firestoreCollection: env.FIRESTORE_COLLECTION ?? "waitlist",
     firestoreDatabaseId: env.FIRESTORE_DATABASE_ID ?? "(default)",
     firestoreProjectId: present(env.FIRESTORE_PROJECT_ID ?? env.GOOGLE_CLOUD_PROJECT),
+    identityPlatformAudience: parseIdentityAudience(env.IDENTITY_PLATFORM_AUDIENCE),
     legacyHosts: parseList(env.LEGACY_HOSTS, DEFAULT_LEGACY_HOSTS),
     mcpBearerToken: parseBearerToken(env.MEDLOCK_MCP_TOKEN),
     port: Number(env.PORT ?? 3000),
@@ -162,6 +167,15 @@ function parseList(value: string | undefined, fallback: readonly string[]): stri
 function present(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function parseIdentityAudience(value: string | undefined): string | undefined {
+  const audience = present(value);
+  if (audience === undefined) return undefined;
+  if (!/^[a-z][a-z0-9-]{4,29}$/.test(audience)) {
+    throw new Error("IDENTITY_PLATFORM_AUDIENCE must be a Google Cloud project id.");
+  }
+  return audience;
 }
 
 function parseBearerToken(value: string | undefined): string | undefined {

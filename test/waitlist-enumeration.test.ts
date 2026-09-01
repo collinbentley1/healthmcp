@@ -376,3 +376,131 @@ describe("waitlist quota enforcement at the boundary", () => {
     expect(consumed).toBe(1);
   });
 });
+
+describe("waitlist activation", () => {
+  const activationPost = (idToken: unknown) =>
+    new Request("http://localhost/api/waitlist/activate", {
+      body: JSON.stringify({ idToken }),
+      headers: { "Content-Type": "application/json", Origin: "http://localhost:3000" },
+      method: "POST",
+    });
+  const configured = getRuntimeConfig({
+    ALLOWED_ORIGINS: "http://localhost:3000",
+    DATA_DIR: "/tmp/medlock-activation-test",
+    IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085",
+    WAITLIST_BACKEND: "memory",
+  });
+  const seeded = async () => {
+    const store = new MemoryWaitlistStore();
+    await createHandler({ config, sleep: async () => {}, waitlistStore: store })(
+      post("member@example.com"),
+    );
+    return store;
+  };
+
+  test("activation refuses outright when the flow is not provisioned", async () => {
+    // No audience configured means no token can be trusted. Refusing is the
+    // only honest answer; activating would be trusting an unnamed issuer.
+    const response = await createHandler({ config, waitlistStore: new MemoryWaitlistStore() })(
+      activationPost("anything"),
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "waitlist activation is not available" });
+  });
+
+  test("a verified token promotes exactly one pending entry", async () => {
+    const store = await seeded();
+    const response = await createHandler({
+      config: configured,
+      identityVerifier: {
+        verify: async () => ({
+          email: "member@example.com",
+          expiresAtMs: 0,
+          issuedAtMs: 0,
+          subject: "subject-1",
+        }),
+      },
+      waitlistStore: store,
+    })(activationPost("token"));
+
+    expect(response.status).toBe(200);
+    const hash = new Bun.CryptoHasher("sha256").update("member@example.com").digest("hex");
+    expect(store.peek(hash)!.status).toBe("confirmed");
+  });
+
+  test("a replayed token is indistinguishable from a first activation", async () => {
+    const store = await seeded();
+    const handler = createHandler({
+      config: configured,
+      identityVerifier: {
+        verify: async () => ({
+          email: "member@example.com",
+          expiresAtMs: 0,
+          issuedAtMs: 0,
+          subject: "subject-1",
+        }),
+      },
+      waitlistStore: store,
+    });
+    const first = await handler(activationPost("token"));
+    const replay = await handler(activationPost("token"));
+
+    expect(replay.status).toBe(first.status);
+    expect(await replay.text()).toBe(await first.text());
+  });
+
+  test("an unverifiable token and an unknown address answer identically", async () => {
+    const store = await seeded();
+    const refuse = await createHandler({
+      config: configured,
+      identityVerifier: {
+        verify: async () => {
+          throw new Error("signature did not verify");
+        },
+      },
+      waitlistStore: store,
+    })(activationPost("token"));
+    const unknown = await createHandler({
+      config: configured,
+      identityVerifier: {
+        verify: async () => ({
+          email: "stranger@example.com",
+          expiresAtMs: 0,
+          issuedAtMs: 0,
+          subject: "subject-2",
+        }),
+      },
+      waitlistStore: store,
+    })(activationPost("token"));
+
+    // Whether an address was ever submitted is a membership fact, so a bad
+    // token and an unknown address must not be told apart.
+    expect(refuse.status).toBe(401);
+    expect(unknown.status).toBe(401);
+    expect(await refuse.text()).toBe(await unknown.text());
+  });
+
+  test("activation spends the shared budget", async () => {
+    const store = await seeded();
+    let consumed = 0;
+    const handler = createHandler({
+      config: configured,
+      identityVerifier: {
+        verify: async () => {
+          throw new Error("nope");
+        },
+      },
+      waitlistQuota: {
+        consume: async () => {
+          consumed += 1;
+          return { allowed: true, retryAfterSeconds: 0 };
+        },
+      },
+      waitlistStore: store,
+    });
+    await handler(activationPost("token"));
+
+    // Otherwise activation would be an unmetered oracle for guessing tokens.
+    expect(consumed).toBe(1);
+  });
+});

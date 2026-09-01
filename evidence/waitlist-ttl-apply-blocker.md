@@ -61,3 +61,50 @@ therefore **not yet enforcing anything in the live project**: until the apply
 lands, `expiresAt` remains a field nobody acts on, abandoned quota buckets
 accumulate, and pending waitlist entries do not expire. The application-side
 opportunistic delete remains defence in depth and is unchanged.
+
+---
+
+# Ownership flow: what is implemented, and what is still blocked
+
+## Implemented and tested
+
+- `src/identity-token.ts` verifies an Identity Platform ID token against
+  Google's published JWKs: pinned RS256 (an `alg` of `none` or `HS256` is
+  refused before any verification), exact `aud` and `iss` for the project,
+  bounded clock skew on `exp`/`iat`, and `email_verified === true`. 19 tests
+  construct real RSA signatures and feed genuinely hostile tokens through the
+  real verify path -- wrong key, tampered payload, wrong project, wrong issuer,
+  unverified email, expired, future-dated, unknown `kid`, unavailable key set.
+- Single-use promotion. `WaitlistStore.confirm` promotes exactly one pending
+  entry; a replay reports `already-confirmed` and leaves the record byte-for-byte
+  unchanged, including which subject confirmed it. Firestore does it inside a
+  transaction whose read set is the entry, so a concurrent second confirmation
+  aborts rather than promoting twice.
+- Confirmation clears the expiry to a far-future instant, so a verified member
+  is never reaped while the field stays present for the TTL policy to read.
+- `POST /api/waitlist/activate` spends the same shared quota, answers uniformly
+  for an unverifiable token and an unknown address, and is indistinguishable
+  between a first activation and a replay.
+- No browser API key exists anywhere in the design, so there is no
+  client-callable Identity Platform surface that could bypass the quota.
+
+## Blocked, and on what
+
+The backend dispatch of `accounts:sendOobCode` is NOT implemented, because
+Identity Platform is not provisioned for this project and cannot be provisioned
+from this repository:
+
+- `identitytoolkit.googleapis.com` and `apikeys.googleapis.com` are available
+  and billing is enabled, but both are disabled today.
+- Enabling them is an ordinary change to healthmcp's `required_services`, which
+  lives in the PLATFORM repository's bootstrap deployment.
+- Creating the Identity Platform config additionally needs
+  `firebaseauth.configs.create/get/update` in the protected prod executor's
+  mutation matrix, which is also in the platform repository. The executor holds
+  none of them today.
+
+`IDENTITY_PLATFORM_AUDIENCE` is therefore unset in production, and activation
+answers 503 rather than trusting a token whose issuer nobody configured. That is
+the intended fail-closed state, but it means **no address can currently reach
+`confirmed`**: the verification half is real and tested, and the delivery half
+does not exist yet.
