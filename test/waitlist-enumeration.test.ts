@@ -86,6 +86,7 @@ describe("waitlist enumeration", () => {
       await store.create({
         clientHash: "seed",
         confirmedAt: null,
+        confirmedSubject: null,
         createdAt: "2026-09-01T12:00:00.000Z",
         email: "timing@example.com",
         emailHash: new Bun.CryptoHasher("sha256").update("timing@example.com").digest("hex"),
@@ -105,6 +106,7 @@ describe("waitlist enumeration", () => {
         monotonic += ms;
       },
       waitlistStore: {
+        confirm: async (...args) => await store.confirm(...args),
         create: async (entry) => {
           const outcome = await store.create(entry);
           // Only the create path does real work.

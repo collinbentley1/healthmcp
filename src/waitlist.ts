@@ -19,6 +19,7 @@ export type WaitlistEntry = {
   readonly email: string;
   readonly emailHash: string;
   readonly expiresAt: string;
+  readonly confirmedSubject: string | null;
   readonly source: string;
   readonly status: WaitlistStatus;
   readonly userAgentHash: string;
@@ -32,8 +33,19 @@ export type WaitlistEntry = {
 // check and the write for a concurrent request to slip through.
 export type WaitlistCreateOutcome = "created" | "duplicate";
 
+export type WaitlistConfirmOutcome = "confirmed" | "already-confirmed" | "absent" | "expired";
+
 export type WaitlistStore = {
   create(entry: WaitlistEntry): Promise<WaitlistCreateOutcome>;
+  // Promotes exactly one pending entry to confirmed, or reports why it could
+  // not. The transition is single-use: a second call with the same proof gets
+  // "already-confirmed", never a second promotion, so a replayed token cannot
+  // reset an entry's state or extend its life.
+  confirm(
+    emailHash: string,
+    subject: string,
+    nowMs: number,
+  ): Promise<WaitlistConfirmOutcome>;
 };
 
 export type WaitlistSubmission = {
@@ -49,6 +61,9 @@ export type WaitlistResult =
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export const PENDING_TTL_SECONDS = 30 * 24 * 60 * 60;
+// Far enough out that the TTL policy never reaps a confirmed member, while
+// leaving the field present so the policy still has something to read.
+export const CONFIRMED_EXPIRES_AT = "9999-12-31T23:59:59.000Z";
 
 export async function submitWaitlist(
   store: WaitlistStore,
@@ -64,6 +79,7 @@ export async function submitWaitlist(
   const entry: WaitlistEntry = {
     clientHash: sha256(submission.clientId || "unknown"),
     confirmedAt: null,
+    confirmedSubject: null,
     createdAt: now.toISOString(),
     email,
     emailHash: sha256(email),
@@ -87,6 +103,29 @@ export class MemoryWaitlistStore implements WaitlistStore {
     }
     this.#entries.set(entry.emailHash, entry);
     return "created";
+  }
+
+  async confirm(
+    emailHash: string,
+    subject: string,
+    nowMs: number,
+  ): Promise<WaitlistConfirmOutcome> {
+    const entry = this.#entries.get(emailHash);
+    if (entry === undefined) return "absent";
+    if (entry.status === "confirmed") return "already-confirmed";
+    if (Date.parse(entry.expiresAt) <= nowMs) return "expired";
+    this.#entries.set(emailHash, {
+      ...entry,
+      confirmedAt: new Date(nowMs).toISOString(),
+      confirmedSubject: subject,
+      // Confirmation clears the expiry: a verified member is not a claim that
+      // ages out. The TTL policy only reaps documents whose expiresAt is in the
+      // past, so a far-future value keeps a confirmed entry indefinitely while
+      // leaving the field present for the policy to read.
+      expiresAt: CONFIRMED_EXPIRES_AT,
+      status: "confirmed",
+    });
+    return "confirmed";
   }
 
   // Test-only inspection. Never reachable from a request path.
@@ -121,6 +160,34 @@ export class FileWaitlistStore implements WaitlistStore {
     }
   }
 
+  async confirm(
+    emailHash: string,
+    subject: string,
+    nowMs: number,
+  ): Promise<WaitlistConfirmOutcome> {
+    const entry = await this.read(emailHash);
+    if (entry === undefined) return "absent";
+    if (entry.status === "confirmed") return "already-confirmed";
+    if (Date.parse(entry.expiresAt) <= nowMs) return "expired";
+    await writeFile(
+      this.#filePath(emailHash),
+      `${
+        JSON.stringify(
+          {
+            ...entry,
+            confirmedAt: new Date(nowMs).toISOString(),
+            confirmedSubject: subject,
+            expiresAt: CONFIRMED_EXPIRES_AT,
+            status: "confirmed",
+          },
+          null,
+          2,
+        )
+      }\n`,
+    );
+    return "confirmed";
+  }
+
   async read(emailHash: string): Promise<WaitlistEntry | undefined> {
     try {
       return JSON.parse(await readFile(this.#filePath(emailHash), "utf8")) as WaitlistEntry;
@@ -148,6 +215,56 @@ export class FirestoreWaitlistStore implements WaitlistStore {
 
   async create(entry: WaitlistEntry): Promise<WaitlistCreateOutcome> {
     return await this.#client.create(this.#collection, entry.emailHash, toFirestoreDocument(entry));
+  }
+
+  // Single-use, decided by Firestore rather than by a read followed by a write.
+  // The transaction's read set is the entry itself, so a concurrent second
+  // confirmation aborts instead of promoting twice or clobbering the first
+  // subject.
+  async confirm(
+    emailHash: string,
+    subject: string,
+    nowMs: number,
+  ): Promise<WaitlistConfirmOutcome> {
+    const name = this.#client.documentName(this.#collection, emailHash);
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const transaction = await this.#client.beginTransaction();
+      try {
+        const documents = await this.#client.batchGet([name], transaction);
+        const document = documents.get(name);
+        if (document === undefined) {
+          await this.#client.rollback(transaction);
+          return "absent";
+        }
+        const entry = fromFirestoreDocument(document);
+        if (entry.status === "confirmed") {
+          await this.#client.rollback(transaction);
+          return "already-confirmed";
+        }
+        if (Date.parse(entry.expiresAt) <= nowMs) {
+          await this.#client.rollback(transaction);
+          return "expired";
+        }
+        const committed = await this.#client.commitTransaction(transaction, [{
+          update: toFirestoreDocument({
+            ...entry,
+            confirmedAt: new Date(nowMs).toISOString(),
+            confirmedSubject: subject,
+            expiresAt: CONFIRMED_EXPIRES_AT,
+            status: "confirmed",
+          }, name),
+          updateMask: {
+            fieldPaths: ["confirmedAt", "confirmedSubject", "expiresAt", "status"],
+          },
+        }]);
+        if (committed) return "confirmed";
+      } catch (error) {
+        await this.#client.rollback(transaction);
+        throw error;
+      }
+    }
+    // Never guess at membership state.
+    throw new Error("Firestore waitlist confirmation could not commit");
   }
 
   async read(emailHash: string): Promise<WaitlistEntry | undefined> {
@@ -196,7 +313,7 @@ function sanitizeSource(value: string | undefined): string {
   return source.replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 60) || "site";
 }
 
-function toFirestoreDocument(entry: WaitlistEntry): FirestoreDocument {
+function toFirestoreDocument(entry: WaitlistEntry, name?: string): FirestoreDocument {
   const fields: Record<string, FirestoreValue> = {
     clientHash: { stringValue: entry.clientHash },
     createdAt: { timestampValue: entry.createdAt },
@@ -210,7 +327,10 @@ function toFirestoreDocument(entry: WaitlistEntry): FirestoreDocument {
   if (entry.confirmedAt !== null) {
     fields.confirmedAt = { timestampValue: entry.confirmedAt };
   }
-  return { fields };
+  if (entry.confirmedSubject !== null) {
+    fields.confirmedSubject = { stringValue: entry.confirmedSubject };
+  }
+  return name === undefined ? { fields } : { fields, name };
 }
 
 function fromFirestoreDocument(document: FirestoreDocument): WaitlistEntry {
@@ -221,6 +341,7 @@ function fromFirestoreDocument(document: FirestoreDocument): WaitlistEntry {
   return {
     clientHash: readString(fields.clientHash),
     confirmedAt: confirmedAt || null,
+    confirmedSubject: readString(fields.confirmedSubject) || null,
     createdAt: readString(fields.createdAt),
     email: readString(fields.email),
     emailHash: readString(fields.emailHash),

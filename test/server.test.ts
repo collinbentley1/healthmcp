@@ -370,6 +370,7 @@ describe("server", () => {
 
   test("keeps waitlist store failures inside the hardened API boundary", async () => {
     const throwingStore: WaitlistStore = {
+      confirm: () => Promise.reject(new Error("private waitlist marker")),
       create: () => Promise.reject(new Error("private waitlist marker")),
     };
     const response = await createHandler({ config, waitlistStore: throwingStore })(

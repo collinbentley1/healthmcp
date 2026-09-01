@@ -9,6 +9,7 @@ export type FirestoreValue =
 
 export type FirestoreDocument = {
   readonly fields?: Record<string, FirestoreValue>;
+  readonly name?: string;
 };
 
 // One Firestore client for every collection this service touches, so the
