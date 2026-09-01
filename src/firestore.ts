@@ -81,6 +81,97 @@ export class FirestoreClient {
     return "created";
   }
 
+  // Serializable transactions.
+  //
+  // A bare commit with `increment` transforms advances every counter and only
+  // then reports what it did, so a request that was always going to be refused
+  // still spends budget on its way to being refused. That is a denial-of-
+  // service primitive: flooding one narrow bucket drains the shared one. A
+  // transaction lets the counters be READ, judged, and only then advanced --
+  // and Firestore aborts the commit if anything the read touched changed
+  // underneath it, so two racing instances cannot both pass the same check.
+  async beginTransaction(): Promise<string> {
+    const response = await this.#fetch(`${this.documentsBaseUrl}:beginTransaction`, {
+      body: JSON.stringify({ options: { readWrite: {} } }),
+      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Firestore beginTransaction failed: ${response.status}`);
+    }
+    const body = (await response.json()) as { transaction?: unknown };
+    if (typeof body.transaction !== "string" || body.transaction.length === 0) {
+      throw new Error("Firestore beginTransaction returned no transaction token");
+    }
+    return body.transaction;
+  }
+
+  // Reads inside the transaction, so the commit that follows is conditional on
+  // these exact documents not having moved.
+  async batchGet(
+    names: readonly string[],
+    transaction: string,
+  ): Promise<ReadonlyMap<string, FirestoreDocument | undefined>> {
+    const response = await this.#fetch(`${this.documentsBaseUrl}:batchGet`, {
+      body: JSON.stringify({ documents: names, transaction }),
+      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Firestore batchGet failed: ${response.status}`);
+    }
+    const results = (await response.json()) as readonly {
+      readonly found?: { readonly fields?: Record<string, FirestoreValue>; readonly name: string };
+      readonly missing?: string;
+    }[];
+    if (!Array.isArray(results) || results.length !== names.length) {
+      throw new Error("Firestore batchGet returned an incomplete result set");
+    }
+    const documents = new Map<string, FirestoreDocument | undefined>();
+    for (const entry of results) {
+      if (typeof entry.missing === "string") {
+        documents.set(entry.missing, undefined);
+        continue;
+      }
+      if (entry.found === undefined || typeof entry.found.name !== "string") {
+        throw new Error("Firestore batchGet returned an unreadable document");
+      }
+      documents.set(entry.found.name, { fields: entry.found.fields });
+    }
+    for (const name of names) {
+      if (!documents.has(name)) {
+        throw new Error("Firestore batchGet omitted a requested document");
+      }
+    }
+    return documents;
+  }
+
+  // Returns false only for a contention abort, which the caller may retry.
+  // Every other failure is a real failure and throws.
+  async commitTransaction(transaction: string, writes: readonly unknown[]): Promise<boolean> {
+    const response = await this.#fetch(`${this.documentsBaseUrl}:commit`, {
+      body: JSON.stringify({ transaction, writes }),
+      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      method: "POST",
+    });
+    if (response.ok) return true;
+    if (response.status === 409 || response.status === 429 || response.status === 503) {
+      return false;
+    }
+    throw new Error(`Firestore transactional commit failed: ${response.status}`);
+  }
+
+  async rollback(transaction: string): Promise<void> {
+    const response = await this.#fetch(`${this.documentsBaseUrl}:rollback`, {
+      body: JSON.stringify({ transaction }),
+      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      method: "POST",
+    });
+    // A rollback that fails changes nothing: the transaction expires on its
+    // own and no write was ever committed under it.
+    void response;
+  }
+
   async commit(writes: readonly unknown[]): Promise<{
     readonly writeResults: readonly { transformResults?: readonly FirestoreValue[] }[];
   }> {

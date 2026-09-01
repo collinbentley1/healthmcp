@@ -22,6 +22,7 @@ export interface WaitlistQuota {
 }
 
 const MAX_QUOTA_RULES = 8;
+const MAX_QUOTA_TRANSACTION_ATTEMPTS = 5;
 
 function assertRules(rules: readonly QuotaRule[]): void {
   if (rules.length < 1 || rules.length > MAX_QUOTA_RULES) {
@@ -75,58 +76,89 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
       throw new Error("waitlist quota requires a valid observation time");
     }
 
-    // One commit. Firestore applies every write in it atomically, and an
-    // `increment` transform returns the value it produced, so the counter is
-    // read and advanced in the same indivisible step. Two instances racing on
-    // the same bucket therefore get two different numbers, never the same one.
-    const writes: unknown[] = rules.map((rule) => {
-      const index = windowIndex(nowMs, rule.windowSeconds);
-      return {
-        update: {
-          fields: {
-            expiresAt: {
-              timestampValue: new Date((index + 2) * rule.windowSeconds * 1_000).toISOString(),
-            },
-          },
-          name: this.#documentName(rule.key, index),
-        },
-        updateMask: { fieldPaths: ["expiresAt"] },
-        updateTransforms: [{ fieldPath: "count", increment: { integerValue: "1" } }],
-      };
-    });
-    // Self-cleaning. The window before last can no longer be consulted by any
-    // instance, so every request retires exactly one bucket and the collection
-    // stays bounded without depending on a TTL policy this service cannot
-    // provision for itself.
-    for (const rule of rules) {
-      writes.push({
-        delete: this.#documentName(rule.key, windowIndex(nowMs, rule.windowSeconds) - 2),
-      });
-    }
-
-    const { writeResults } = await this.#client.commit(writes);
-    // A commit that does not report a counter for every rule has an unknown
-    // outcome, and an unknown outcome cannot authorize a request.
-    if (writeResults.length !== writes.length) {
-      throw new Error("Firestore waitlist quota commit returned an incomplete result set");
-    }
-
-    let allowed = true;
-    let retryAfterSeconds = 0;
-    rules.forEach((rule, position) => {
-      const transform = writeResults[position]?.transformResults?.[0];
-      const raw = transform && "integerValue" in transform ? transform.integerValue : undefined;
-      const count = raw === undefined ? Number.NaN : Number(raw);
-      if (!Number.isSafeInteger(count) || count < 1) {
-        throw new Error("Firestore waitlist quota commit returned an unusable counter");
+    // Check every bucket, THEN advance them -- and only if all of them allow it.
+    //
+    // The previous shape incremented first and judged afterwards, so a request
+    // that was always going to be refused still spent the shared budget on its
+    // way to being refused. Flooding one narrow bucket (a single address, say)
+    // therefore drained the global one and denied service to everybody else.
+    // A read-judge-write transaction removes that: a refusal costs the narrow
+    // bucket nothing and the global bucket nothing.
+    //
+    // Firestore aborts the commit if any document the read touched changed
+    // underneath it, so two instances cannot both observe "one slot left" and
+    // both take it. An abort is retried; running out of retries fails closed.
+    const names = rules.map((rule) => this.#documentName(rule.key, windowIndex(nowMs, rule.windowSeconds)));
+    for (let attempt = 1; attempt <= MAX_QUOTA_TRANSACTION_ATTEMPTS; attempt += 1) {
+      const transaction = await this.#client.beginTransaction();
+      let decided: QuotaDecision | undefined;
+      try {
+        const documents = await this.#client.batchGet(names, transaction);
+        let allowed = true;
+        let retryAfterSeconds = 0;
+        rules.forEach((rule, position) => {
+          const document = documents.get(names[position]!);
+          const raw = document?.fields?.count;
+          const current = raw === undefined
+            ? 0
+            : "integerValue" in raw
+            ? Number(raw.integerValue)
+            : Number.NaN;
+          // A counter that cannot be read is not a counter that reads zero.
+          if (!Number.isSafeInteger(current) || current < 0) {
+            throw new Error("Firestore waitlist quota read an unusable counter");
+          }
+          if (current + 1 > rule.limit) {
+            allowed = false;
+            retryAfterSeconds = Math.max(retryAfterSeconds, retryAfter(nowMs, rule.windowSeconds));
+          }
+        });
+        if (!allowed) {
+          decided = { allowed: false, retryAfterSeconds };
+        } else {
+          const writes: unknown[] = rules.map((rule, position) => {
+            const index = windowIndex(nowMs, rule.windowSeconds);
+            return {
+              update: {
+                fields: {
+                  expiresAt: {
+                    timestampValue: new Date((index + 2) * rule.windowSeconds * 1_000)
+                      .toISOString(),
+                  },
+                },
+                name: names[position]!,
+              },
+              updateMask: { fieldPaths: ["expiresAt"] },
+              updateTransforms: [{ fieldPath: "count", increment: { integerValue: "1" } }],
+            };
+          });
+          // Self-cleaning defence in depth. The window before last can no
+          // longer be consulted, so every allowed request retires one bucket.
+          // The authoritative bound is the Firestore TTL policy on `expiresAt`,
+          // which also reaps buckets that never receive another request.
+          for (const rule of rules) {
+            writes.push({
+              delete: this.#documentName(rule.key, windowIndex(nowMs, rule.windowSeconds) - 2),
+            });
+          }
+          if (await this.#client.commitTransaction(transaction, writes)) {
+            return { allowed: true, retryAfterSeconds: 0 };
+          }
+          // Contention: somebody else moved a counter this decision was based
+          // on, so the decision is void and the whole thing is retried.
+          continue;
+        }
+      } catch (error) {
+        await this.#client.rollback(transaction);
+        throw error;
       }
-      if (count > rule.limit) {
-        allowed = false;
-        retryAfterSeconds = Math.max(retryAfterSeconds, retryAfter(nowMs, rule.windowSeconds));
-      }
-    });
-
-    return allowed ? { allowed: true, retryAfterSeconds: 0 } : { allowed: false, retryAfterSeconds };
+      // A refusal writes nothing at all, which is the entire point.
+      await this.#client.rollback(transaction);
+      return decided;
+    }
+    // Retries exhausted under sustained contention. Fail closed: an instance
+    // that never got a clean read has no idea what the budget is.
+    throw new Error("Firestore waitlist quota could not commit a decision");
   }
 
   #documentName(key: string, index: number): string {
@@ -142,20 +174,26 @@ export class MemoryWaitlistQuota implements WaitlistQuota {
   async consume(rules: readonly QuotaRule[], now: Date): Promise<QuotaDecision> {
     assertRules(rules);
     const nowMs = now.getTime();
+    // Same semantics as the Firestore path: judge every bucket first, and spend
+    // nothing at all if any of them refuses. A refusal must not cost budget, or
+    // one narrow bucket can be flooded to drain a shared one.
     let allowed = true;
     let retryAfterSeconds = 0;
     for (const rule of rules) {
       const index = windowIndex(nowMs, rule.windowSeconds);
-      const id = `${rule.key}--${index}`;
-      const count = (this.#counters.get(id) ?? 0) + 1;
-      this.#counters.set(id, count);
-      this.#counters.delete(`${rule.key}--${index - 2}`);
-      if (count > rule.limit) {
+      const current = this.#counters.get(`${rule.key}--${index}`) ?? 0;
+      if (current + 1 > rule.limit) {
         allowed = false;
         retryAfterSeconds = Math.max(retryAfterSeconds, retryAfter(nowMs, rule.windowSeconds));
       }
     }
-    return allowed ? { allowed: true, retryAfterSeconds: 0 } : { allowed: false, retryAfterSeconds };
+    if (!allowed) return { allowed: false, retryAfterSeconds };
+    for (const rule of rules) {
+      const index = windowIndex(nowMs, rule.windowSeconds);
+      this.#counters.set(`${rule.key}--${index}`, (this.#counters.get(`${rule.key}--${index}`) ?? 0) + 1);
+      this.#counters.delete(`${rule.key}--${index - 2}`);
+    }
+    return { allowed: true, retryAfterSeconds: 0 };
   }
 
   get trackedBucketCount(): number {

@@ -6,14 +6,24 @@ import {
   type QuotaRule,
 } from "../src/waitlist-quota.ts";
 
-// A commit fixture that behaves like Firestore: writes are applied atomically,
-// an `increment` transform returns the value it produced, and a delete of a
-// document that is not there is a no-op. Counters live outside the client, so
-// several clients can share one -- which is the whole point, since the defect
-// being fixed is that every Cloud Run instance kept its own.
+// A Firestore fixture that speaks the transaction protocol, because that is
+// what the quota now uses: begin, read inside the transaction, judge, and only
+// then commit. Counters live outside the client so several clients can share
+// one -- which is the point, since the defect being fixed is that every Cloud
+// Run instance kept its own.
+//
+// `abortNext` models contention: Firestore aborts a commit whose read set moved
+// underneath it, and the caller must retry rather than assume its decision
+// still holds.
 function firestoreFleet() {
   const counters = new Map<string, number>();
+  const versions = new Map<string, number>();
+  const readSets = new Map<string, Map<string, number>>();
   const commits: unknown[][] = [];
+  const rollbacks: string[] = [];
+  let transactions = 0;
+  let abortNext = 0;
+  const versionOf = (name: string) => versions.get(name) ?? 0;
   const client = (fetcher?: FetchLike) =>
     new FirestoreClient({
       databaseId: "(default)",
@@ -22,23 +32,77 @@ function firestoreFleet() {
         if (url.includes("metadata.google.internal")) {
           return Response.json({ access_token: "token", expires_in: 3600 });
         }
-        const body = JSON.parse(String(init?.body)) as { writes: Record<string, unknown>[] };
+        if (url.endsWith(":beginTransaction")) {
+          transactions += 1;
+          return Response.json({ transaction: `txn-${transactions}` });
+        }
+        if (url.endsWith(":batchGet")) {
+          const body = JSON.parse(String(init?.body)) as {
+            documents: string[];
+            transaction: string;
+          };
+          // Record the read set and the version each document had when read,
+          // so the commit below can detect that something moved underneath it.
+          readSets.set(
+            body.transaction,
+            new Map(body.documents.map((name) => [name, versionOf(name)])),
+          );
+          return Response.json(body.documents.map((name) => {
+            const current = counters.get(name);
+            return current === undefined
+              ? { missing: name }
+              : { found: { fields: { count: { integerValue: String(current) } }, name } };
+          }));
+        }
+        if (url.endsWith(":rollback")) {
+          rollbacks.push(JSON.parse(String(init?.body)).transaction as string);
+          return Response.json({});
+        }
+        const body = JSON.parse(String(init?.body)) as {
+          transaction?: string;
+          writes: Record<string, unknown>[];
+        };
+        if (abortNext > 0) {
+          abortNext -= 1;
+          return new Response("", { status: 409 });
+        }
+        // Serializable isolation: if any document this transaction read has
+        // changed since it read it, the commit aborts and the caller must
+        // decide again. This is what stops two instances both observing "one
+        // slot left" and both taking it.
+        const readSet = body.transaction === undefined
+          ? undefined
+          : readSets.get(body.transaction);
+        if (readSet !== undefined) {
+          for (const [name, seen] of readSet) {
+            if (versionOf(name) !== seen) return new Response("", { status: 409 });
+          }
+        }
         commits.push(body.writes);
-        const writeResults = body.writes.map((write) => {
+        for (const write of body.writes) {
           if (typeof write.delete === "string") {
             counters.delete(write.delete);
-            return {};
+            versions.set(write.delete, versionOf(write.delete) + 1);
+            continue;
           }
           const name = (write.update as { name: string }).name;
-          const next = (counters.get(name) ?? 0) + 1;
-          counters.set(name, next);
-          return { transformResults: [{ integerValue: String(next) }] };
-        });
-        return Response.json({ writeResults });
+          counters.set(name, (counters.get(name) ?? 0) + 1);
+          versions.set(name, versionOf(name) + 1);
+        }
+        return Response.json({ writeResults: body.writes.map(() => ({})) });
       }),
       projectId: "medlock-1025243085",
     });
-  return { client, commits, counters };
+  return {
+    abort: (times: number) => {
+      abortNext = times;
+    },
+    client,
+    commits,
+    counters,
+    rollbacks,
+    transactionCount: () => transactions,
+  };
 }
 
 const quotaOf = (fleet: ReturnType<typeof firestoreFleet>, fetcher?: FetchLike) =>
@@ -106,31 +170,128 @@ describe("waitlist quota", () => {
         ? Response.json({ access_token: "token", expires_in: 3600 })
         : new Response("upstream exploded", { status: 503 }));
 
-    await expect(quota.consume([RULE], AT)).rejects.toThrow("Firestore commit failed: 503");
+    await expect(quota.consume([RULE], AT)).rejects.toThrow("beginTransaction failed: 503");
   });
 
-  test("a commit that answers for fewer writes than it was given is refused", async () => {
+  test("a read that answers for fewer documents than it was asked is refused", async () => {
     const fleet = firestoreFleet();
-    const quota = quotaOf(fleet, async (input) =>
-      String(input).includes("metadata.google.internal")
-        ? Response.json({ access_token: "token", expires_in: 3600 })
-        : Response.json({ writeResults: [{ transformResults: [{ integerValue: "1" }] }] }));
+    const quota = quotaOf(fleet, async (input) => {
+      const url = String(input);
+      if (url.includes("metadata.google.internal")) {
+        return Response.json({ access_token: "token", expires_in: 3600 });
+      }
+      if (url.endsWith(":beginTransaction")) return Response.json({ transaction: "txn" });
+      if (url.endsWith(":rollback")) return Response.json({});
+      // One document requested, none returned.
+      return Response.json([]);
+    });
 
     await expect(quota.consume([RULE], AT)).rejects.toThrow("incomplete result set");
   });
 
-  test.each([
-    ["absent", {}],
-    ["non-numeric", { transformResults: [{ integerValue: "many" }] }],
-    ["zero", { transformResults: [{ integerValue: "0" }] }],
-  ])("a commit whose counter is %s is refused", async (_label, first) => {
+  test("a read that answers for a document nobody asked about is refused", async () => {
     const fleet = firestoreFleet();
-    const quota = quotaOf(fleet, async (input) =>
-      String(input).includes("metadata.google.internal")
-        ? Response.json({ access_token: "token", expires_in: 3600 })
-        : Response.json({ writeResults: [first, {}] }));
+    const quota = quotaOf(fleet, async (input) => {
+      const url = String(input);
+      if (url.includes("metadata.google.internal")) {
+        return Response.json({ access_token: "token", expires_in: 3600 });
+      }
+      if (url.endsWith(":beginTransaction")) return Response.json({ transaction: "txn" });
+      if (url.endsWith(":rollback")) return Response.json({});
+      return Response.json([{ missing: "projects/x/databases/(default)/documents/other/doc" }]);
+    });
+
+    await expect(quota.consume([RULE], AT)).rejects.toThrow("omitted a requested document");
+  });
+
+  test.each([
+    ["non-numeric", { integerValue: "many" }],
+    ["negative", { integerValue: "-1" }],
+  ])("a counter read as %s is refused", async (_label, count) => {
+    const fleet = firestoreFleet();
+    const quota = quotaOf(fleet, async (input, init) => {
+      const url = String(input);
+      if (url.includes("metadata.google.internal")) {
+        return Response.json({ access_token: "token", expires_in: 3600 });
+      }
+      if (url.endsWith(":beginTransaction")) return Response.json({ transaction: "txn" });
+      if (url.endsWith(":rollback")) return Response.json({});
+      const name = (JSON.parse(String(init?.body)) as { documents: string[] }).documents[0]!;
+      return Response.json([{ found: { fields: { count }, name } }]);
+    });
 
     await expect(quota.consume([RULE], AT)).rejects.toThrow("unusable counter");
+  });
+
+  test("sustained contention fails closed rather than guessing", async () => {
+    const fleet = firestoreFleet();
+    fleet.abort(99);
+    const quota = quotaOf(fleet);
+
+    // An instance that never got a clean commit has no idea what the budget is.
+    await expect(quota.consume([RULE], AT)).rejects.toThrow("could not commit a decision");
+    expect(fleet.commits).toEqual([]);
+  });
+
+  test("a contention abort is retried and then succeeds", async () => {
+    const fleet = firestoreFleet();
+    fleet.abort(2);
+    const quota = quotaOf(fleet);
+
+    await expect(quota.consume([RULE], AT)).resolves.toEqual({
+      allowed: true,
+      retryAfterSeconds: 0,
+    });
+    expect(fleet.transactionCount()).toBe(3);
+  });
+
+  test("a refusal spends nothing at all", async () => {
+    const fleet = firestoreFleet();
+    const quota = quotaOf(fleet);
+    for (let index = 0; index < 3; index += 1) await quota.consume([RULE], AT);
+    const commitsBefore = fleet.commits.length;
+
+    const refused = await quota.consume([RULE], AT);
+
+    expect(refused.allowed).toBe(false);
+    // No write of any kind: the previous shape incremented first and judged
+    // afterwards, so even a doomed request spent budget on its way to refusal.
+    expect(fleet.commits.length).toBe(commitsBefore);
+    expect(fleet.rollbacks).toHaveLength(1);
+  });
+
+  test("flooding one address cannot exhaust the shared budget", async () => {
+    // The denial-of-service this fixes. `email` is narrow (3/hour) and `global`
+    // is shared (60/minute). Under increment-then-judge, 200 attempts against
+    // one address burned 200 units of the global budget and locked everybody
+    // else out. Now the 4th attempt onwards costs the global bucket nothing.
+    const fleet = firestoreFleet();
+    const quota = quotaOf(fleet);
+    const flood = (index: number) => [
+      { key: "waitlist:global", limit: 60, windowSeconds: 60 },
+      { key: `waitlist:email:${"a".repeat(32)}`, limit: 3, windowSeconds: 3_600 },
+      { key: `waitlist:client:attacker-${index}`, limit: 5, windowSeconds: 60 },
+    ];
+
+    let allowed = 0;
+    for (let index = 0; index < 200; index += 1) {
+      if ((await quota.consume(flood(index), AT)).allowed) allowed += 1;
+    }
+    expect(allowed).toBe(3);
+
+    // An unrelated client, same window, is still served.
+    const bystander = await quota.consume([
+      { key: "waitlist:global", limit: 60, windowSeconds: 60 },
+      { key: `waitlist:email:${"b".repeat(32)}`, limit: 3, windowSeconds: 3_600 },
+      { key: "waitlist:client:bystander", limit: 5, windowSeconds: 60 },
+    ], AT);
+    expect(bystander.allowed).toBe(true);
+
+    // And the shared bucket only ever advanced for the four allowed requests.
+    const globalKey = [...fleet.counters.keys()].find((name) =>
+      name.includes("waitlist__global")
+    )!;
+    expect(fleet.counters.get(globalKey)).toBe(4);
   });
 
   test("rules must be unique, bounded, and safely keyed", async () => {
