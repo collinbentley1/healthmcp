@@ -226,6 +226,33 @@ convention.
 
 ---
 
+## 3. The reviewed Terraform mirror
+
+A latent break, found while integrating: the platform's mirror contract requires
+`infra/terraform/prod/main.tf` to contain **only** the reviewed module, compared
+after parsing (which strips comments) and whitespace-compaction. Every resource
+added here -- the two TTL fields and the Identity Platform pair -- would have
+been rejected by this repository's own app-contract CI, including the TTL fields
+added before this session.
+
+The mirror now carries an `additionalProductionResources` entry pinning exactly
+those four resources for repository `1025243085`, so the platform reviews what
+this repository may add rather than the check simply refusing it. Two
+consequences worth knowing:
+
+- The pinned form is comment-free, because the comparison strips comments. The
+  prose in `main.tf` is free to change; the resources are not.
+- `container_env` is rendered mechanically from the contract, so it cannot carry
+  comments and its values cannot be Terraform references. `IDENTITY_PLATFORM_AUDIENCE`
+  is therefore pinned as a literal project id rather than `var.project_id`.
+
+Verified by running `validateTerraformMirrorContract` against this repository's
+actual Terraform: it reports no failures. That check also caught the continue URL
+pointing at `/waitlist/confirm` when the endpoint that performs the exchange is
+`/api/waitlist/confirm`.
+
+---
+
 ## What does not require platform
 
 Already implemented and verified in this branch: structured decoding of Firestore

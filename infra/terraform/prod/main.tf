@@ -25,18 +25,14 @@ module "site" {
   preview_operator_service_account_email         = var.preview_operator_service_account_email
   preview_publisher_service_account_email        = var.preview_publisher_service_account_email
   container_env = {
-    ALLOWED_HOSTS    = "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app"
-    ALLOWED_ORIGINS  = "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app"
-    CANONICAL_HOST   = "medlock.ai"
-    LEGACY_HOSTS     = "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app"
-    MEDLOCK_VERSION  = "0.2.0"
-    WAITLIST_BACKEND = "firestore"
-    # Both halves of the ownership flow. The audience is the project whose ID
-    # tokens are trusted on activation; the continue URL is where the mailed
-    # sign-in link returns to. The service refuses to challenge anyone unless
-    # both are set, so these are what turn verification on.
-    IDENTITY_PLATFORM_AUDIENCE     = var.project_id
-    IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/waitlist/confirm"
+    ALLOWED_HOSTS                  = "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app"
+    ALLOWED_ORIGINS                = "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app"
+    CANONICAL_HOST                 = "medlock.ai"
+    LEGACY_HOSTS                   = "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app"
+    MEDLOCK_VERSION                = "0.2.0"
+    WAITLIST_BACKEND               = "firestore"
+    IDENTITY_PLATFORM_AUDIENCE     = "medlock-1025243085"
+    IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/api/waitlist/confirm"
   }
   runtime_secret_ids               = var.runtime_secret_ids
   runtime_secret_accessor_ids      = var.runtime_secret_accessor_ids
