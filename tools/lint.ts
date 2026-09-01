@@ -55,6 +55,23 @@ await requireContains(
 // The in-process limiter above is per-instance and so can only ever be a first
 // pass. The decision that actually bounds abuse is the shared one, and it has
 // to be a single atomic call for the same reason the local one does.
+// `expiresAt` is inert until a TTL policy names it. The opportunistic delete in
+// the quota only retires buckets that receive another request, so an abandoned
+// per-address bucket -- the kind bulk abuse creates -- would otherwise live
+// forever, and an unverified pending entry would never actually expire.
+for (const collection of ["waitlist", "waitlist_quota"]) {
+  await requireContains(
+    "infra/terraform/prod/main.tf",
+    `collection = "${collection}"`,
+    `The ${collection} collection must have a Firestore TTL policy.`,
+  );
+}
+await requireContains(
+  "infra/terraform/prod/main.tf",
+  "ttl_config {}",
+  "Firestore TTL must be configured on the expiresAt field, not merely written into documents.",
+);
+
 await requireContains(
   "src/server.ts",
   "quota.consume(quotaRules, now())",

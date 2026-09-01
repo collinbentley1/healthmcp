@@ -42,3 +42,41 @@ module "site" {
     runtime_collection_env_value = "waitlist"
   }
 }
+
+# Real time-to-live, not a timestamp nobody enforces.
+#
+# Both collections carry an `expiresAt` field, and until a TTL policy names that
+# field Firestore does nothing with it. The application's opportunistic delete
+# only ever retires a bucket that receives another request, so an abandoned
+# per-address or per-client bucket -- exactly the ones an attacker creates in
+# bulk -- would live forever, and an unverified pending entry would never
+# actually expire.
+#
+# `ttl_config {}` with no offset means "expire at the instant the field holds".
+# `index_config {}` is set explicitly rather than omitted, because an omitted
+# block is not "leave indexing alone": the provider treats it as a disable.
+resource "google_firestore_field" "waitlist_entry_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_firestore_field" "waitlist_quota_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist_quota"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
