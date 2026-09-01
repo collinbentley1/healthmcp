@@ -26,6 +26,15 @@ updates:
       time: "09:15"
       timezone: America/New_York
     open-pull-requests-limit: 2
+    ignore:
+      # Dependabot runs Terraform 1.15.9. These roots require `~> 1.14.0`,
+      # which is `>= 1.14.0, < 1.15.0`, so its `terraform init` can never
+      # resolve the provider here -- and a newer bundled Terraform moves
+      # further away, not closer. The production constraint is deliberate and
+      # is not changed to suit the bot, so the provider check is disabled
+      # rather than left to fail weekly. The entry itself stays: the module
+      # dependency is tracked successfully and is the immutable platform pin.
+      - dependency-name: "hashicorp/google"
 
   - package-ecosystem: terraform
     directory: /infra/terraform/prod
@@ -35,3 +44,12 @@ updates:
       time: "09:30"
       timezone: America/New_York
     open-pull-requests-limit: 2
+    ignore:
+      # Dependabot runs Terraform 1.15.9. These roots require `~> 1.14.0`,
+      # which is `>= 1.14.0, < 1.15.0`, so its `terraform init` can never
+      # resolve the provider here -- and a newer bundled Terraform moves
+      # further away, not closer. The production constraint is deliberate and
+      # is not changed to suit the bot, so the provider check is disabled
+      # rather than left to fail weekly. The entry itself stays: the module
+      # dependency is tracked successfully and is the immutable platform pin.
+      - dependency-name: "hashicorp/google"
