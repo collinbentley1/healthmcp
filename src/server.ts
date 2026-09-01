@@ -25,6 +25,7 @@ type ServerDependencies = {
   readonly waitlistQuota?: WaitlistQuota;
   readonly waitlistStore?: WaitlistStore;
   readonly sleep?: (ms: number) => Promise<void>;
+  readonly monotonicNow?: () => number;
 };
 
 export const MAX_REQUEST_BODY_SIZE = 1_048_576;
@@ -35,6 +36,15 @@ const MAX_WAITLIST_BODY_SIZE = 8_192;
 // "created" and "already there". One create attempt happens either way; the
 // floor covers the storage engine's own variance.
 export const WAITLIST_TIMING_FLOOR_MS = 300;
+export const WAITLIST_TIMING_JITTER_MS = 120;
+
+// Unpredictable to the caller: drawn from the CSPRNG, not Math.random, because
+// a predictable pad is a pad an attacker can subtract back out.
+function waitlistTimingJitterMs(): number {
+  const draw = new Uint32Array(1);
+  crypto.getRandomValues(draw);
+  return (draw[0]! / 2 ** 32) * WAITLIST_TIMING_JITTER_MS;
+}
 
 // The authoritative buckets. `unestablished` is what makes cookie minting
 // pointless: discarding a cookie to get a fresh client id moves the request
@@ -83,6 +93,7 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
       : new MemoryWaitlistQuota());
   const sleep = dependencies.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
@@ -127,6 +138,7 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           waitlistIdentitySecrets,
           now,
           sleep,
+          monotonicNow,
         );
       }
 
@@ -189,6 +201,7 @@ async function handleWaitlist(
   identitySecrets: readonly Uint8Array[],
   now: () => Date,
   sleep: (ms: number) => Promise<void>,
+  monotonicNow: () => number,
 ): Promise<Response> {
   if (request.method === "OPTIONS") {
     return withSecurityHeaders(new Response(null, { headers: corsHeaders(request, config), status: 204 }));
@@ -292,12 +305,20 @@ async function handleWaitlist(
   // From here to the response, every path costs the same wall time and returns
   // the same bytes. Nothing downstream may branch on whether the address was
   // already present.
-  const startedAtMs = now().getTime();
+  // Measured on a MONOTONIC clock, not the wall clock. `now()` is the injected
+  // Date source and can step backwards or jump -- an NTP correction mid-request
+  // would make `elapsed` negative or huge and either remove the pad entirely or
+  // stall the response.
+  const startedAt = monotonicNow();
   const settle = async (response: Response): Promise<Response> => {
-    const elapsed = now().getTime() - startedAtMs;
-    if (elapsed < WAITLIST_TIMING_FLOOR_MS) {
-      await sleep(WAITLIST_TIMING_FLOOR_MS - elapsed);
-    }
+    const elapsed = monotonicNow() - startedAt;
+    // Floor plus bounded unpredictable jitter. The floor alone equalises the
+    // two paths only while both finish under it; the jitter means a single
+    // observation carries less information about which side of the floor the
+    // work actually landed on, and repeated sampling has to average through
+    // noise the attacker does not control.
+    const target = WAITLIST_TIMING_FLOOR_MS + waitlistTimingJitterMs();
+    if (elapsed < target) await sleep(target - elapsed);
     return respond(response);
   };
 

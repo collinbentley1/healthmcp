@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { getRuntimeConfig } from "../src/config.ts";
-import { createHandler, WAITLIST_TIMING_FLOOR_MS } from "../src/server.ts";
+import {
+  createHandler,
+  WAITLIST_TIMING_FLOOR_MS,
+  WAITLIST_TIMING_JITTER_MS,
+} from "../src/server.ts";
 import { MemoryWaitlistQuota, type QuotaRule, type WaitlistQuota } from "../src/waitlist-quota.ts";
 import { resolveWaitlistClient } from "../src/waitlist-client.ts";
 import { MemoryWaitlistStore, type WaitlistStore } from "../src/waitlist.ts";
@@ -65,60 +69,118 @@ describe("waitlist enumeration", () => {
     expect("duplicate" in second).toBe(false);
   });
 
-  test("both outcomes are held to the same timing floor", async () => {
-    const slept: number[] = [];
-    let clock = Date.parse("2026-09-01T12:00:00.000Z");
+  // The exact invariant, stated rather than implied.
+  //
+  // This is a FLOOR, not constant time. It guarantees: no accepted submission
+  // returns before WAITLIST_TIMING_FLOOR_MS of monotonic time have passed, and
+  // the pad is extended by an unpredictable draw the caller cannot subtract
+  // back out. It does NOT guarantee that a backend slower than the floor is
+  // hidden -- if the create path ever exceeded the floor, the excess would be
+  // observable, and that limit is asserted below rather than papered over.
+  const paddedRun = async (options: {
+    readonly backendMs: number;
+    readonly duplicate: boolean;
+  }) => {
     const store = new MemoryWaitlistStore();
+    if (options.duplicate) {
+      await store.create({
+        clientHash: "seed",
+        confirmedAt: null,
+        createdAt: "2026-09-01T12:00:00.000Z",
+        email: "timing@example.com",
+        emailHash: new Bun.CryptoHasher("sha256").update("timing@example.com").digest("hex"),
+        expiresAt: "2026-10-01T12:00:00.000Z",
+        source: "test",
+        status: "pending",
+        userAgentHash: "seed",
+      });
+    }
+    let monotonic = 1_000;
+    const slept: number[] = [];
     const handler = createHandler({
       config,
-      now: () => new Date(clock),
-      // A duplicate is cheap and a create is not; advancing the clock only on
-      // the create is the worst case this floor has to absorb.
+      monotonicNow: () => monotonic,
       sleep: async (ms: number) => {
         slept.push(ms);
-        clock += ms;
+        monotonic += ms;
       },
       waitlistStore: {
         create: async (entry) => {
           const outcome = await store.create(entry);
-          if (outcome === "created") clock += 120;
+          // Only the create path does real work.
+          if (outcome === "created") monotonic += options.backendMs;
           return outcome;
         },
       } satisfies WaitlistStore,
     });
-
+    const started = monotonic;
     await handler(post("timing@example.com"));
-    const createdPad = slept.at(-1)!;
-    await handler(post("timing@example.com"));
-    const duplicatePad = slept.at(-1)!;
+    return { elapsed: monotonic - started, slept };
+  };
 
-    expect(createdPad).toBe(WAITLIST_TIMING_FLOOR_MS - 120);
-    expect(duplicatePad).toBe(WAITLIST_TIMING_FLOOR_MS);
-    // Both land on the floor, so the observable time is identical.
-    expect(createdPad + 120).toBe(duplicatePad);
+  test("no accepted submission returns before the floor, whichever outcome it was", async () => {
+    const created = await paddedRun({ backendMs: 120, duplicate: false });
+    const duplicate = await paddedRun({ backendMs: 120, duplicate: true });
+
+    expect(created.elapsed).toBeGreaterThanOrEqual(WAITLIST_TIMING_FLOOR_MS);
+    expect(duplicate.elapsed).toBeGreaterThanOrEqual(WAITLIST_TIMING_FLOOR_MS);
+    // Both were padded; neither returned early because its work was cheap.
+    expect(created.slept).toHaveLength(1);
+    expect(duplicate.slept).toHaveLength(1);
   });
 
-  test("a slow backend is never padded backwards", async () => {
-    const slept: number[] = [];
-    let clock = Date.parse("2026-09-01T12:00:00.000Z");
-    const handler = createHandler({
-      config,
-      now: () => new Date(clock),
-      sleep: async (ms: number) => {
-        slept.push(ms);
-        clock += ms;
-      },
-      waitlistStore: {
-        create: async () => {
-          clock += WAITLIST_TIMING_FLOOR_MS * 3;
-          return "created";
-        },
-      } satisfies WaitlistStore,
+  test("the pad is unpredictable and bounded", async () => {
+    const draws = new Set<number>();
+    for (let index = 0; index < 12; index += 1) {
+      const run = await paddedRun({ backendMs: 0, duplicate: true });
+      expect(run.elapsed).toBeGreaterThanOrEqual(WAITLIST_TIMING_FLOOR_MS);
+      expect(run.elapsed).toBeLessThan(WAITLIST_TIMING_FLOOR_MS + WAITLIST_TIMING_JITTER_MS);
+      draws.add(run.elapsed);
+    }
+    // A fixed floor would give one value every time; the jitter is what stops a
+    // single observation from being a clean read of the work underneath it.
+    expect(draws.size).toBeGreaterThan(1);
+  });
+
+  test("the floor does not truncate work slower than itself, and that is the limit", async () => {
+    // Stated honestly: a backend slower than the floor IS observable. The floor
+    // equalises the paths only while both finish under it, which is why the
+    // create path must not carry work the duplicate path does not -- no
+    // synchronous mail dispatch on the new-address side, for instance.
+    const slow = await paddedRun({
+      backendMs: WAITLIST_TIMING_FLOOR_MS + WAITLIST_TIMING_JITTER_MS + 500,
+      duplicate: false,
     });
 
-    await handler(post("slow@example.com"));
-    expect(slept).toHaveLength(0);
+    expect(slow.slept).toHaveLength(0);
+    expect(slow.elapsed).toBeGreaterThan(WAITLIST_TIMING_FLOOR_MS + WAITLIST_TIMING_JITTER_MS);
   });
+
+  test("a wall-clock jump cannot remove the pad", async () => {
+    // The pad is measured monotonically, so a clock that leaps forward mid
+    // request -- an NTP correction, say -- neither cancels it nor stalls on it.
+    let monotonic = 5_000;
+    const slept: number[] = [];
+    let wall = Date.parse("2026-09-01T12:00:00.000Z");
+    const handler = createHandler({
+      config,
+      monotonicNow: () => monotonic,
+      now: () => {
+        wall += 86_400_000;
+        return new Date(wall);
+      },
+      sleep: async (ms: number) => {
+        slept.push(ms);
+        monotonic += ms;
+      },
+      waitlistStore: new MemoryWaitlistStore(),
+    });
+
+    await handler(post("clockjump@example.com"));
+    expect(slept).toHaveLength(1);
+    expect(slept[0]!).toBeGreaterThan(0);
+  });
+
 });
 
 describe("waitlist quota enforcement at the boundary", () => {
