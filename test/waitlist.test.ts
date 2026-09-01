@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { FirestoreClient, type FetchLike } from "../src/firestore.ts";
 import {
+  waitlistEntryFromUnknown,
   FileWaitlistStore,
   FirestoreWaitlistStore,
   MemoryWaitlistStore,
@@ -173,17 +174,203 @@ describe("waitlist confirmation", () => {
     expect(await store.confirm(other, "subject-1", AT + 1_000)).toBe("absent");
   });
 
-  test("the file store promotes and replays identically", async () => {
-    // Unique per run: a fixed path would carry a previous run's confirmed
-    // entry forward and make the first promotion report already-confirmed.
+  test("the file store refuses to confirm rather than racing two promotions", async () => {
+    // Read-then-write has no compare-and-swap, so two concurrent confirmations
+    // would both succeed and the second subject would overwrite the first --
+    // contradicting the single-use interface. Refusing is the honest answer.
     const directory = `/tmp/medlock-confirm-${crypto.randomUUID()}`;
     const store = new FileWaitlistStore(directory);
     await submitWaitlist(store, { clientId: "c", email: "confirm@example.com" }, new Date(AT));
 
-    expect(await store.confirm(HASH, "subject-1", AT + 1_000)).toBe("confirmed");
-    expect(await store.confirm(HASH, "subject-2", AT + 2_000)).toBe("already-confirmed");
-    const entry = (await store.read(HASH))!;
-    expect(entry.status).toBe("confirmed");
-    expect(entry.confirmedSubject).toBe("subject-1");
+    await expect(store.confirm()).rejects.toThrow("no compare-and-swap");
+    // And the entry is untouched.
+    expect((await store.read(HASH))!.status).toBe("pending");
+  });
+});
+
+describe("waitlist record validation", () => {
+  const EMAIL = "record@example.com";
+  const HASH2 = new Bun.CryptoHasher("sha256").update(EMAIL).digest("hex");
+  const sound = () => ({
+    clientHash: "c".repeat(64),
+    confirmedAt: null,
+    confirmedSubject: null,
+    createdAt: "2026-09-01T12:00:00.000Z",
+    email: EMAIL,
+    emailHash: HASH2,
+    expiresAt: "2026-10-01T12:00:00.000Z",
+    source: "site",
+    status: "pending",
+    userAgentHash: "u".repeat(64),
+  });
+
+  test("a sound record validates", () => {
+    expect(waitlistEntryFromUnknown(sound(), HASH2).status).toBe("pending");
+  });
+
+  test.each([
+    ["a missing expiry", { expiresAt: undefined }],
+    ["an empty expiry", { expiresAt: "" }],
+    ["an unparseable expiry", { expiresAt: "whenever" }],
+    ["a non-canonical expiry", { expiresAt: "2026-10-01T12:00:00Z" }],
+  ])("%s is refused rather than read as unexpired", (_label, patch) => {
+    // The fail-open shape: Date.parse yields NaN, `NaN <= now` is false, and the
+    // record was treated as unexpired and promoted.
+    expect(() => waitlistEntryFromUnknown({ ...sound(), ...patch }, HASH2)).toThrow();
+  });
+
+  test.each([
+    ["an unknown status", { status: "verified" }],
+    ["a missing status", { status: undefined }],
+    ["a numeric status", { status: 1 }],
+  ])("%s is refused rather than coerced to pending", (_label, patch) => {
+    expect(() => waitlistEntryFromUnknown({ ...sound(), ...patch }, HASH2))
+      .toThrow("not a recognised state");
+  });
+
+  test("a hash that does not match its email is refused", () => {
+    expect(() => waitlistEntryFromUnknown({ ...sound(), emailHash: "d".repeat(64) }, "d".repeat(64)))
+      .toThrow("does not match its email");
+  });
+
+  test("a record for another address is refused even if internally consistent", () => {
+    // Document identity and contents must agree, or confirming one address
+    // would confirm another.
+    const other = "other@example.com";
+    const record = {
+      ...sound(),
+      email: other,
+      emailHash: new Bun.CryptoHasher("sha256").update(other).digest("hex"),
+    };
+    expect(() => waitlistEntryFromUnknown(record, HASH2))
+      .toThrow("does not belong to the requested address");
+  });
+
+  test("an unnormalised email is refused", () => {
+    const upper = "Record@Example.COM";
+    const record = {
+      ...sound(),
+      email: upper,
+      emailHash: new Bun.CryptoHasher("sha256").update(upper).digest("hex"),
+    };
+    expect(() => waitlistEntryFromUnknown(record, record.emailHash)).toThrow("not normalised");
+  });
+
+  test.each([
+    ["pending but confirmed", { confirmedAt: "2026-09-01T12:00:00.000Z", status: "pending" }],
+    ["pending but has a subject", { confirmedSubject: "s", status: "pending" }],
+    ["confirmed but has no confirmation", { status: "confirmed" }],
+  ])("a record that is %s is refused", (_label, patch) => {
+    expect(() => waitlistEntryFromUnknown({ ...sound(), ...patch }, HASH2)).toThrow();
+  });
+
+});
+
+describe("waitlist confirmation concurrency", () => {
+  const EMAIL = "race@example.com";
+  const HASH3 = new Bun.CryptoHasher("sha256").update(EMAIL).digest("hex");
+  const AT3 = Date.parse("2026-09-01T12:00:00.000Z");
+
+  test("two genuinely interleaved confirmations produce exactly one promotion", async () => {
+    // A barrier, not two sequential calls. Both transactions read the pending
+    // entry BEFORE either commits, which is the interleaving that read-then-
+    // write cannot survive: without a compare-and-swap both would report
+    // confirmed and the second subject would overwrite the first.
+    let version = 0;
+    let readers = 0;
+    let releaseBarrier: () => void = () => {};
+    const bothHaveRead = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const readVersions = new Map<string, number>();
+    const commits: string[] = [];
+    let record: Record<string, unknown> = {
+      clientHash: "c".repeat(64),
+      createdAt: "2026-09-01T12:00:00.000Z",
+      email: EMAIL,
+      emailHash: HASH3,
+      expiresAt: "2026-10-01T12:00:00.000Z",
+      source: "site",
+      status: "pending",
+      userAgentHash: "u".repeat(64),
+    };
+    const INSTANT_FIELDS = new Set(["confirmedAt", "createdAt", "expiresAt"]);
+    const toFields = () =>
+      Object.fromEntries(
+        Object.entries(record).map(([key, value]) =>
+          INSTANT_FIELDS.has(key)
+            ? [key, { timestampValue: String(value) }]
+            : [key, { stringValue: String(value) }]
+        ),
+      );
+
+    const fetcher: FetchLike = async (input, init) => {
+      const url = String(input);
+      if (url.includes("metadata.google.internal")) {
+        return Response.json({ access_token: "token", expires_in: 3600 });
+      }
+      if (url.endsWith(":beginTransaction")) {
+        readers += 1;
+        return Response.json({ transaction: `txn-${readers}` });
+      }
+      if (url.endsWith(":batchGet")) {
+        const body = JSON.parse(String(init?.body)) as {
+          documents: string[];
+          transaction: string;
+        };
+        readVersions.set(body.transaction, version);
+        // Hold until both transactions have read the same pending state.
+        if (readVersions.size >= 2) releaseBarrier();
+        else await bothHaveRead;
+        return Response.json([{ found: { fields: toFields(), name: body.documents[0]! } }]);
+      }
+      if (url.endsWith(":rollback")) return Response.json({});
+      const body = JSON.parse(String(init?.body)) as {
+        transaction: string;
+        writes: {
+          update: {
+            fields: Record<string, { stringValue?: string; timestampValue?: string }>;
+          };
+        }[];
+      };
+      if (readVersions.get(body.transaction) !== version) {
+        return Response.json(
+          { error: { code: 409, message: "contention", status: "ABORTED" } },
+          { status: 409 },
+        );
+      }
+      version += 1;
+      commits.push(body.transaction);
+      // Firestore stores instants as timestampValue and text as stringValue;
+      // a fixture that only reads one of them is not modelling the store.
+      record = Object.fromEntries(
+        Object.entries(body.writes[0]!.update.fields).map(([key, value]) => [
+          key,
+          value.stringValue ?? value.timestampValue,
+        ]),
+      );
+      return Response.json({ writeResults: [{}] });
+    };
+
+    const store = new FirestoreWaitlistStore({
+      client: new FirestoreClient({
+        databaseId: "(default)",
+        fetcher,
+        projectId: "medlock-1025243085",
+      }),
+      collection: "waitlist",
+    });
+
+    const [first, second] = await Promise.all([
+      store.confirm(HASH3, "subject-first", AT3 + 1_000),
+      store.confirm(HASH3, "subject-second", AT3 + 1_000),
+    ]);
+
+    // Exactly one promotion, whichever won; the loser sees the committed state.
+    expect([first, second].filter((outcome) => outcome === "confirmed")).toHaveLength(1);
+    expect([first, second].filter((outcome) => outcome === "already-confirmed")).toHaveLength(1);
+    // And exactly one write reached the store.
+    expect(commits).toHaveLength(1);
+    expect(record.status).toBe("confirmed");
   });
 });

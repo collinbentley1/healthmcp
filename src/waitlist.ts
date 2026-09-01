@@ -94,6 +94,95 @@ export async function submitWaitlist(
   return { ok: true, outcome: await store.create(entry) };
 }
 
+// One strict validator for every persisted record, used by every path that is
+// about to act on one.
+//
+// The failure this closes is subtle and fails OPEN: an expiry check written as
+// `Date.parse(entry.expiresAt) <= nowMs` is FALSE when the parse yields NaN, so
+// a record with a missing, empty, or corrupt expiry was treated as unexpired
+// and promoted. A legacy row, a partial write, or a hand-edited document was
+// therefore a path to confirmation. Nothing here coerces: a record that is not
+// internally consistent is refused, and the caller mutates nothing.
+export function waitlistEntryFromUnknown(
+  value: unknown,
+  expectedEmailHash: string,
+): WaitlistEntry {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("waitlist record is not an object");
+  }
+  const source = value as Record<string, unknown>;
+  const text = (field: string, max = 512): string => {
+    const raw = source[field];
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > max) {
+      throw new Error(`waitlist record field ${field} is malformed`);
+    }
+    return raw;
+  };
+  const instant = (field: string): string => {
+    const raw = text(field, 64);
+    const parsed = Date.parse(raw);
+    // Canonical, and above all FINITE: an unparseable timestamp must not become
+    // a comparison that silently succeeds.
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== raw) {
+      throw new Error(`waitlist record field ${field} is not a canonical instant`);
+    }
+    return raw;
+  };
+  const nullableText = (field: string, max = 512): string | null => {
+    const raw = source[field];
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > max) {
+      throw new Error(`waitlist record field ${field} is malformed`);
+    }
+    return raw;
+  };
+
+  const status = source.status;
+  if (status !== "pending" && status !== "confirmed") {
+    // Never coerce an unknown state to pending: an unrecognised status is a
+    // record this code does not understand, not a claim awaiting confirmation.
+    throw new Error("waitlist record status is not a recognised state");
+  }
+
+  const email = text("email", 254);
+  if (email !== normalizeEmail(email)) {
+    throw new Error("waitlist record email is not normalised");
+  }
+  const emailHash = text("emailHash", 64);
+  // The record must be about the address it claims, and must be the record the
+  // caller asked for. Either mismatch means the document identity and its
+  // contents disagree, and acting on it would confirm somebody else's address.
+  if (emailHash !== sha256(email)) {
+    throw new Error("waitlist record hash does not match its email");
+  }
+  if (emailHash !== expectedEmailHash) {
+    throw new Error("waitlist record does not belong to the requested address");
+  }
+
+  const confirmedAt = nullableText("confirmedAt", 64);
+  const confirmedSubject = nullableText("confirmedSubject", 128);
+  if (status === "pending" && (confirmedAt !== null || confirmedSubject !== null)) {
+    throw new Error("waitlist record is pending but carries confirmation fields");
+  }
+  if (status === "confirmed" && (confirmedAt === null || confirmedSubject === null)) {
+    throw new Error("waitlist record is confirmed but carries no confirmation");
+  }
+  if (confirmedAt !== null) instant("confirmedAt");
+
+  return {
+    clientHash: text("clientHash", 64),
+    confirmedAt,
+    confirmedSubject,
+    createdAt: instant("createdAt"),
+    email,
+    emailHash,
+    expiresAt: instant("expiresAt"),
+    source: text("source", 60),
+    status,
+    userAgentHash: text("userAgentHash", 64),
+  };
+}
+
 export class MemoryWaitlistStore implements WaitlistStore {
   readonly #entries = new Map<string, WaitlistEntry>();
 
@@ -110,8 +199,11 @@ export class MemoryWaitlistStore implements WaitlistStore {
     subject: string,
     nowMs: number,
   ): Promise<WaitlistConfirmOutcome> {
-    const entry = this.#entries.get(emailHash);
-    if (entry === undefined) return "absent";
+    const stored = this.#entries.get(emailHash);
+    if (stored === undefined) return "absent";
+    // Validated before it is acted on, so a corrupt expiry cannot become a
+    // comparison that quietly succeeds.
+    const entry = waitlistEntryFromUnknown(stored, emailHash);
     if (entry.status === "confirmed") return "already-confirmed";
     if (Date.parse(entry.expiresAt) <= nowMs) return "expired";
     this.#entries.set(emailHash, {
@@ -160,32 +252,18 @@ export class FileWaitlistStore implements WaitlistStore {
     }
   }
 
-  async confirm(
-    emailHash: string,
-    subject: string,
-    nowMs: number,
-  ): Promise<WaitlistConfirmOutcome> {
-    const entry = await this.read(emailHash);
-    if (entry === undefined) return "absent";
-    if (entry.status === "confirmed") return "already-confirmed";
-    if (Date.parse(entry.expiresAt) <= nowMs) return "expired";
-    await writeFile(
-      this.#filePath(emailHash),
-      `${
-        JSON.stringify(
-          {
-            ...entry,
-            confirmedAt: new Date(nowMs).toISOString(),
-            confirmedSubject: subject,
-            expiresAt: CONFIRMED_EXPIRES_AT,
-            status: "confirmed",
-          },
-          null,
-          2,
-        )
-      }\n`,
+  // Deliberately unsupported.
+  //
+  // A durable single-use transition needs a compare-and-swap, and this backend
+  // has none: read-then-write lets two concurrent confirmations both succeed,
+  // with the second subject overwriting the first. That would contradict the
+  // interface, so rather than offer a promotion that is only single-use when
+  // nobody races it, this refuses. Deployed services are required to run the
+  // Firestore backend, which does have one.
+  async confirm(): Promise<WaitlistConfirmOutcome> {
+    throw new Error(
+      "The file waitlist backend has no compare-and-swap and cannot confirm ownership; use WAITLIST_BACKEND=firestore.",
     );
-    return "confirmed";
   }
 
   async read(emailHash: string): Promise<WaitlistEntry | undefined> {
@@ -236,7 +314,7 @@ export class FirestoreWaitlistStore implements WaitlistStore {
           await this.#client.rollback(transaction);
           return "absent";
         }
-        const entry = fromFirestoreDocument(document);
+        const entry = waitlistEntryFromUnknown(fromFirestoreDocument(document), emailHash);
         if (entry.status === "confirmed") {
           await this.#client.rollback(transaction);
           return "already-confirmed";
@@ -335,6 +413,9 @@ function toFirestoreDocument(entry: WaitlistEntry, name?: string): FirestoreDocu
 
 function fromFirestoreDocument(document: FirestoreDocument): WaitlistEntry {
   const fields = document.fields ?? {};
+  // Read faithfully. Mapping an unrecognised status to "pending" here would
+  // hand waitlistEntryFromUnknown a record that always validates, which is
+  // exactly the coercion that made a corrupt document promotable.
   const status = readString(fields.status);
   const confirmedAt = readString(fields.confirmedAt);
 
@@ -347,7 +428,7 @@ function fromFirestoreDocument(document: FirestoreDocument): WaitlistEntry {
     emailHash: readString(fields.emailHash),
     expiresAt: readString(fields.expiresAt),
     source: readString(fields.source),
-    status: status === "confirmed" ? "confirmed" : "pending",
+    status: status as WaitlistStatus,
     userAgentHash: readString(fields.userAgentHash),
   };
 }
