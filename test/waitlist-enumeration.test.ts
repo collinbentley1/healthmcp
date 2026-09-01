@@ -107,6 +107,7 @@ describe("waitlist enumeration", () => {
       },
       waitlistStore: {
         confirm: async (...args) => await store.confirm(...args),
+        pendingExists: async (...args) => await store.pendingExists(...args),
         create: async (entry) => {
           const outcome = await store.create(entry);
           // Only the create path does real work.

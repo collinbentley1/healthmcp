@@ -22,6 +22,11 @@ const GOOGLE_SECURETOKEN_JWK_URL =
 const MAX_JWK_BYTES = 64 * 1024;
 const MAX_TOKEN_BYTES = 8 * 1024;
 const CLOCK_SKEW_MS = 60_000;
+// How recently the holder must have proved control of the address. Shorter
+// than the token's own hour-long validity on purpose: this is the window in
+// which a promotion may be performed, not the window in which the token
+// remains parseable.
+const MAX_AUTH_AGE_MS = 10 * 60 * 1_000;
 const MAX_KID_LENGTH = 256;
 const MAX_EMAIL_LENGTH = 254;
 
@@ -141,6 +146,23 @@ export class IdentityTokenVerifier {
     }
     if (nowMs >= exp + CLOCK_SKEW_MS) {
       throw new Error("identity token has expired");
+    }
+    // Freshness, separately from expiry.
+    //
+    // An Identity Platform ID token stays valid for an hour, so `exp` alone
+    // would let a token captured early be replayed for the rest of that hour
+    // against an entry that had not yet been created. `auth_time` is when the
+    // holder actually proved control of the address, and promotion requires
+    // that proof to be recent -- which is a much tighter window than the
+    // token's own lifetime and is not something the bearer can extend.
+    // integralSeconds returns milliseconds, as `exp` and `iat` above already
+    // are, so everything on this path is compared in one unit.
+    const authTimeMs = integralSeconds(payload.auth_time, "identity token auth time");
+    if (authTimeMs > iat + CLOCK_SKEW_MS) {
+      throw new Error("identity token timing claims are malformed");
+    }
+    if (nowMs >= authTimeMs + MAX_AUTH_AGE_MS) {
+      throw new Error("identity token authentication is too old to activate");
     }
     if (iat > nowMs + CLOCK_SKEW_MS) {
       throw new Error("identity token was issued in the future");

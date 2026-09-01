@@ -15,6 +15,7 @@ import {
   type WaitlistQuota,
 } from "./waitlist-quota.ts";
 import { IdentityTokenVerifier } from "./identity-token.ts";
+import { IdentityPlatformClient } from "./identity-platform.ts";
 import { createWaitlistStore, normalizeEmail, sha256, submitWaitlist, type WaitlistStore } from "./waitlist.ts";
 
 type ServerDependencies = {
@@ -28,6 +29,7 @@ type ServerDependencies = {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly monotonicNow?: () => number;
   readonly identityVerifier?: { verify: IdentityTokenVerifier["verify"] };
+  readonly identityDispatcher?: { sendSignInLink: IdentityPlatformClient["sendSignInLink"] };
 };
 
 export const MAX_REQUEST_BODY_SIZE = 1_048_576;
@@ -103,6 +105,18 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
     (config.identityPlatformAudience === undefined
       ? undefined
       : new IdentityTokenVerifier({ audience: config.identityPlatformAudience }));
+  // Dispatch needs both halves: the project whose tokens will be trusted, and
+  // the destination the mailed link may return to. Missing either means the
+  // ownership flow is not provisioned, and the challenge endpoint refuses for
+  // every address alike rather than half-working for some.
+  const identityDispatcher = dependencies.identityDispatcher ??
+    (config.identityPlatformAudience === undefined ||
+        config.identityPlatformContinueUrl === undefined
+      ? undefined
+      : new IdentityPlatformClient({
+        continueUrl: config.identityPlatformContinueUrl,
+        projectId: config.identityPlatformAudience,
+      }));
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
@@ -144,6 +158,21 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           waitlistStore,
           waitlistQuota,
           rateLimiter,
+          waitlistIdentitySecrets,
+          now,
+          sleep,
+          monotonicNow,
+        );
+      }
+
+      if (url.pathname === "/api/waitlist/challenge") {
+        return await handleWaitlistChallenge(
+          request,
+          config,
+          waitlistStore,
+          waitlistQuota,
+          rateLimiter,
+          identityDispatcher,
           waitlistIdentitySecrets,
           now,
           sleep,
@@ -362,6 +391,153 @@ async function handleWaitlist(
   // entry or found one already there is internal state; publishing it is the
   // enumeration oracle, whether it is published as a body field, a status code,
   // a header, or a message on the page.
+  return await settle(apiJson({ ok: true }, request, config, { status: 202 }));
+}
+
+// Challenge dispatch: the first half of the ownership flow.
+//
+// The endpoint sends a single-use, short-lived sign-in link to an address that
+// has already asked to be on the list. Two constraints shape all of it.
+//
+// It must not become a mail cannon. If any well-formed address could be typed
+// in and mailed, this endpoint would send attacker-chosen mail to
+// attacker-chosen strangers over this project's sending reputation, so a link
+// only goes to an address with a live pending entry.
+//
+// And it must not answer the membership question it necessarily asks. The
+// response is byte-identical and equal-cost whether the address is on the list,
+// absent, expired, already confirmed, or failed to send. The only place the
+// distinction ever surfaces is the mailbox itself, which is exactly the party
+// already entitled to know.
+async function handleWaitlistChallenge(
+  request: Request,
+  config: RuntimeConfig,
+  store: WaitlistStore,
+  quota: WaitlistQuota,
+  rateLimiter: InMemoryRateLimiter,
+  dispatcher: { sendSignInLink: IdentityPlatformClient["sendSignInLink"] } | undefined,
+  identitySecrets: readonly Uint8Array[],
+  now: () => Date,
+  sleep: (ms: number) => Promise<void>,
+  monotonicNow: () => number,
+): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return withSecurityHeaders(
+      new Response(null, { headers: corsHeaders(request, config), status: 204 }),
+    );
+  }
+  if (request.method !== "POST") {
+    return apiJson({ error: "method not allowed" }, request, config, {
+      headers: { Allow: "POST, OPTIONS" },
+      status: 405,
+    });
+  }
+  if (dispatcher === undefined) {
+    // Fail closed, and identically for everyone. Refusing here -- before the
+    // address is even parsed -- means an unprovisioned deployment cannot leak
+    // membership through the difference between "sent" and "could not send".
+    return apiJson({ error: "waitlist verification is not available" }, request, config, {
+      status: 503,
+    });
+  }
+
+  const client = resolveWaitlistClient(request, identitySecrets);
+  const respond = (response: Response): Response =>
+    withWaitlistClientCookie(response, client.setCookie);
+
+  const localRules: RateLimitRule[] = [
+    { key: `waitlist:client:${client.id}`, limit: WAITLIST_QUOTA_LIMITS.client.limit, windowMs: 60_000 },
+    { key: "waitlist:global", limit: WAITLIST_QUOTA_LIMITS.global.limit, windowMs: 60_000 },
+  ];
+  if (!client.authenticated) {
+    localRules.unshift({
+      key: "waitlist:unestablished",
+      limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+      windowMs: 60_000,
+    });
+  }
+  const local = rateLimiter.checkMany(localRules);
+  if (!local.allowed) {
+    const response = rateLimitedWaitlistResponse(request, config, local.retryAfterSeconds);
+    return client.authenticated ? respond(response) : response;
+  }
+
+  const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim()
+    .toLowerCase();
+  if (contentType !== "application/json") {
+    return respond(apiJson({ error: "expected application/json" }, request, config, { status: 415 }));
+  }
+  const parsedBody = await readBoundedJson(request, MAX_WAITLIST_BODY_SIZE);
+  if (parsedBody.kind === "too-large") {
+    return respond(apiJson({ error: "request body too large" }, request, config, { status: 413 }));
+  }
+  if (parsedBody.kind === "invalid") {
+    return respond(apiJson({ error: "invalid JSON body" }, request, config, { status: 400 }));
+  }
+  const body = parsedBody.value as { email?: unknown } | undefined;
+  if (!body || typeof body.email !== "string") {
+    return respond(apiJson({ error: "email is required" }, request, config, { status: 400 }));
+  }
+
+  const normalized = normalizeEmail(body.email);
+  const quotaRules: QuotaRule[] = [
+    {
+      key: "waitlist:global",
+      limit: WAITLIST_QUOTA_LIMITS.global.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+    },
+    {
+      key: `waitlist:email:${sha256(normalized).slice(0, 32)}`,
+      limit: WAITLIST_QUOTA_LIMITS.email.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.email.windowSeconds,
+    },
+    client.authenticated
+      ? {
+        key: `waitlist:client:${client.id.toLowerCase()}`,
+        limit: WAITLIST_QUOTA_LIMITS.client.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+      }
+      : {
+        key: "waitlist:unestablished",
+        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
+      },
+  ];
+  let decision;
+  try {
+    decision = await quota.consume(quotaRules, now());
+  } catch {
+    // The shared limiter is the only thing standing between this endpoint and
+    // unmetered mail. If it cannot decide, nothing is sent.
+    return respond(apiJson({ error: "service unavailable" }, request, config, { status: 503 }));
+  }
+  if (!decision.allowed) {
+    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+    return client.authenticated ? respond(response) : response;
+  }
+
+  // Everything past this point costs the same wall time and returns the same
+  // bytes, on the same monotonic clock the submit path uses.
+  const startedAt = monotonicNow();
+  const settle = async (response: Response): Promise<Response> => {
+    const elapsed = monotonicNow() - startedAt;
+    const target = WAITLIST_TIMING_FLOOR_MS + waitlistTimingJitterMs();
+    if (elapsed < target) await sleep(target - elapsed);
+    return respond(response);
+  };
+
+  const nowMs = now().getTime();
+  try {
+    if (await store.pendingExists(sha256(normalized), nowMs)) {
+      await dispatcher.sendSignInLink(normalized, nowMs);
+    }
+  } catch {
+    // Swallowed on purpose. Whether a send was attempted, and whether it
+    // succeeded, are both statements about membership; surfacing either as a
+    // distinct status would rebuild the oracle the uniform response exists to
+    // close. Nothing is promoted here either way -- promotion requires a
+    // verified token, which only a real delivery can produce.
+  }
   return await settle(apiJson({ ok: true }, request, config, { status: 202 }));
 }
 

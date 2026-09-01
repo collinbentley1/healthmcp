@@ -72,6 +72,69 @@ await requireContains(
   "Firestore TTL must be configured on the expiresAt field, not merely written into documents.",
 );
 
+// Firestore's reaper only acts on values stored as timestamps. A field written
+// as a string is ignored outright -- no error and no deletion -- so a policy
+// could be perfectly configured and still bound nothing.
+await requireContains(
+  "src/waitlist.ts",
+  "expiresAt: { timestampValue: entry.expiresAt }",
+  "expiresAt must be stored as a timestamp; Firestore TTL ignores string values.",
+);
+await requireContains(
+  "src/waitlist-quota.ts",
+  "expiresAt: {\n                    timestampValue:",
+  "Quota buckets must store expiresAt as a timestamp; Firestore TTL ignores string values.",
+);
+// Terraform declaring a policy is not the same as the database enforcing one.
+// The gate below reads the live field configuration back, and is the only
+// thing that tells those two states apart.
+await requireContains(
+  "package.json",
+  '"verify:ttl"',
+  "A live TTL verification gate must remain wired into the project's scripts.",
+);
+
+// The ownership flow, and the two ways it could quietly become dangerous.
+//
+// An API key would make the Identity Platform send endpoint callable by anyone
+// who reads the page, turning the project into a mail relay aimed at strangers.
+// Dispatching without a membership check would do the same thing from the
+// server side.
+for (const path of ["src/identity-platform.ts", "src/server.ts", "infra/terraform/prod/main.tf"]) {
+  await rejectContains(
+    path,
+    "identitytoolkit.googleapis.com/v1/accounts",
+    "Challenge dispatch must use the project-scoped admin endpoint, never the API-key surface.",
+  );
+  await rejectContains(
+    path,
+    "key=",
+    "No Identity Platform API key may appear anywhere in the ownership flow.",
+  );
+}
+await requireContains(
+  "src/server.ts",
+  "if (await store.pendingExists(sha256(normalized), nowMs)) {",
+  "A sign-in link may only be dispatched to an address with a live pending entry.",
+);
+await requireContains(
+  "infra/terraform/prod/main.tf",
+  "password_required = false",
+  "Identity Platform must use email-link sign-in; no password may be set for this project.",
+);
+await requireContains(
+  "infra/terraform/prod/main.tf",
+  "authorized_domains",
+  "Sign-in links must be restricted to authorized return domains.",
+);
+// A token stays parseable for an hour; promotion must require a much fresher
+// proof than that.
+await requireContains(
+  "src/identity-token.ts",
+  "identity token authentication is too old to activate",
+  "Activation must bound how recently ownership was proved, not merely that the token has not expired.",
+);
+
 await requireContains(
   "src/server.ts",
   "quota.consume(quotaRules, now())",

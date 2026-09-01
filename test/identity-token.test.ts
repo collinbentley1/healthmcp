@@ -34,6 +34,7 @@ async function signToken(options: {
     aud: PROJECT,
     email: "person@example.com",
     email_verified: true,
+    auth_time: Math.floor(NOW / 1_000) - 60,
     exp: Math.floor(NOW / 1_000) + 3_600,
     iat: Math.floor(NOW / 1_000) - 60,
     iss: `https://securetoken.google.com/${PROJECT}`,
@@ -76,6 +77,41 @@ describe("identity token verification", () => {
     ).rejects.toThrow("signature did not verify");
   });
 
+  // An ID token remains parseable for an hour. Promotion is a much narrower
+  // privilege than "this token is still valid", so it is gated on when the
+  // holder actually proved control of the address.
+  test("a token whose authentication is stale cannot activate", async () => {
+    const stale = await signToken({
+      payload: { auth_time: Math.floor(NOW / 1_000) - 11 * 60 },
+    });
+    // Still unexpired -- this is not the expiry check doing the work.
+    await expect(verifier().verify(stale, NOW)).rejects.toThrow(/too old to activate/);
+  });
+
+  test("a token authenticated moments ago still activates", async () => {
+    const fresh = await signToken({
+      payload: { auth_time: Math.floor(NOW / 1_000) - 9 * 60 },
+    });
+    expect((await verifier().verify(fresh, NOW)).email).toBe("person@example.com");
+  });
+
+  test("auth_time cannot be pushed into the future to buy a longer window", async () => {
+    await expect(
+      verifier().verify(
+        await signToken({ payload: { auth_time: Math.floor(NOW / 1_000) + 3_600 } }),
+        NOW,
+      ),
+    ).rejects.toThrow(/malformed/);
+  });
+
+  test("a missing or non-integral auth_time is refused rather than defaulted", async () => {
+    for (const authTime of [undefined, null, "1234567890", 1.5, Number.NaN]) {
+      await expect(
+        verifier().verify(await signToken({ payload: { auth_time: authTime } }), NOW),
+      ).rejects.toThrow();
+    }
+  });
+
   test("a tampered payload is refused", async () => {
     const token = await signToken({});
     const [header, , signature] = token.split(".") as [string, string, string];
@@ -83,6 +119,7 @@ describe("identity token verification", () => {
       aud: PROJECT,
       email: "victim@example.com",
       email_verified: true,
+      auth_time: Math.floor(NOW / 1_000) - 60,
       exp: Math.floor(NOW / 1_000) + 3_600,
       iat: Math.floor(NOW / 1_000) - 60,
       iss: `https://securetoken.google.com/${PROJECT}`,
@@ -178,7 +215,13 @@ describe("identity token verification", () => {
     await counting.verify(await signToken({}), NOW);
     await counting.verify(await signToken({}), NOW + 60_000);
     expect(fetches).toBe(1);
-    await counting.verify(await signToken({}), NOW + 11 * 60_000);
+    // Authenticated at the advanced clock, so this exercises the key cache
+    // rather than the separate auth_time freshness bound.
+    const later = Math.floor((NOW + 11 * 60_000) / 1_000);
+    await counting.verify(
+      await signToken({ payload: { auth_time: later - 60, exp: later + 3_600, iat: later - 60 } }),
+      NOW + 11 * 60_000,
+    );
     expect(fetches).toBe(2);
   });
 

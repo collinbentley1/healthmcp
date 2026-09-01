@@ -14,6 +14,7 @@ export type RuntimeConfig = {
   // means the ownership flow is not provisioned, and activation refuses rather
   // than guessing at an audience.
   readonly identityPlatformAudience: string | undefined;
+  readonly identityPlatformContinueUrl: string | undefined;
   readonly legacyHosts: readonly string[];
   readonly mcpBearerToken: string | undefined;
   readonly port: number;
@@ -82,6 +83,7 @@ export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.e
     firestoreDatabaseId: env.FIRESTORE_DATABASE_ID ?? "(default)",
     firestoreProjectId: present(env.FIRESTORE_PROJECT_ID ?? env.GOOGLE_CLOUD_PROJECT),
     identityPlatformAudience: parseIdentityAudience(env.IDENTITY_PLATFORM_AUDIENCE),
+    identityPlatformContinueUrl: parseContinueUrl(env.IDENTITY_PLATFORM_CONTINUE_URL),
     legacyHosts: parseList(env.LEGACY_HOSTS, DEFAULT_LEGACY_HOSTS),
     mcpBearerToken: parseBearerToken(env.MEDLOCK_MCP_TOKEN),
     port: Number(env.PORT ?? 3000),
@@ -176,6 +178,30 @@ function parseList(value: string | undefined, fallback: readonly string[]): stri
 function present(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+// Where the sign-in link lands. This is a redirect target that Identity
+// Platform will send to a mailbox, so it is validated rather than trusted: an
+// attacker-supplied continue URL would turn the ownership mail into an open
+// redirect carrying a single-use credential in its query string.
+function parseContinueUrl(value: string | undefined): string | undefined {
+  const raw = present(value);
+  if (raw === undefined) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("IDENTITY_PLATFORM_CONTINUE_URL must be an absolute URL.");
+  }
+  if (url.protocol !== "https:") {
+    throw new Error("IDENTITY_PLATFORM_CONTINUE_URL must use https.");
+  }
+  // The oobCode arrives as a query parameter, so anything already carrying a
+  // query or fragment is refused rather than merged with.
+  if (url.search !== "" || url.hash !== "" || url.username !== "" || url.password !== "") {
+    throw new Error("IDENTITY_PLATFORM_CONTINUE_URL must not carry credentials, a query, or a fragment.");
+  }
+  return url.toString();
 }
 
 function parseIdentityAudience(value: string | undefined): string | undefined {

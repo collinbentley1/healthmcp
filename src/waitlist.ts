@@ -46,7 +46,28 @@ export type WaitlistStore = {
     subject: string,
     nowMs: number,
   ): Promise<WaitlistConfirmOutcome>;
+  // Whether a live pending entry exists for this hash.
+  //
+  // Deliberately a boolean and not the entry. The only caller is the challenge
+  // dispatcher, which needs to know whether sending mail to this address is
+  // something the address already asked for -- and nothing else. Returning the
+  // record would put the stored address, its creation time, and its client
+  // hash within reach of a request path that has no use for them.
+  pendingExists(emailHash: string, nowMs: number): Promise<boolean>;
 };
+
+// One judgement of "live and pending", shared by every backend so they cannot
+// disagree. A record that does not validate is not pending: a corrupt entry
+// must not become a reason to send mail.
+function entryIsPending(stored: unknown, emailHash: string, nowMs: number): boolean {
+  let entry;
+  try {
+    entry = waitlistEntryFromUnknown(stored, emailHash);
+  } catch {
+    return false;
+  }
+  return entry.status === "pending" && Date.parse(entry.expiresAt) > nowMs;
+}
 
 export type WaitlistSubmission = {
   readonly clientId: string;
@@ -223,6 +244,10 @@ export class MemoryWaitlistStore implements WaitlistStore {
     return "confirmed";
   }
 
+  async pendingExists(emailHash: string, nowMs: number): Promise<boolean> {
+    return entryIsPending(this.#entries.get(emailHash), emailHash, nowMs);
+  }
+
   // Test-only inspection. Never reachable from a request path.
   peek(emailHash: string): WaitlistEntry | undefined {
     return this.#entries.get(emailHash);
@@ -267,6 +292,10 @@ export class FileWaitlistStore implements WaitlistStore {
     throw new Error(
       "The file waitlist backend has no compare-and-swap and cannot confirm ownership; use WAITLIST_BACKEND=firestore.",
     );
+  }
+
+  async pendingExists(emailHash: string, nowMs: number): Promise<boolean> {
+    return entryIsPending(await this.read(emailHash), emailHash, nowMs);
   }
 
   async read(emailHash: string): Promise<WaitlistEntry | undefined> {
@@ -358,6 +387,12 @@ export class FirestoreWaitlistStore implements WaitlistStore {
     }
     // Never guess at membership state.
     throw new Error("Firestore waitlist confirmation could not commit");
+  }
+
+  async pendingExists(emailHash: string, nowMs: number): Promise<boolean> {
+    const document = await this.#client.get(this.#collection, emailHash);
+    if (document === undefined) return false;
+    return entryIsPending(fromFirestoreDocument(document), emailHash, nowMs);
   }
 
   async read(emailHash: string): Promise<WaitlistEntry | undefined> {
