@@ -1,6 +1,17 @@
+import { firestoreErrorIs } from "./firestore-error.ts";
+
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export type FirestoreCreateOutcome = "created" | "duplicate";
+
+// A committed transaction carries back what its transforms produced, aligned
+// with the writes that were sent. `increment` is a single-document atomic
+// transform, so the value returned here is the authoritative post-increment
+// count -- which is what lets a caller enforce a hard cap without depending on
+// any cross-document isolation guarantee.
+export type FirestoreCommitOutcome =
+  | { readonly committed: true; readonly transformResults: readonly (readonly FirestoreValue[])[] }
+  | { readonly committed: false };
 
 export type FirestoreValue =
   | { readonly integerValue: string }
@@ -10,7 +21,19 @@ export type FirestoreValue =
 export type FirestoreDocument = {
   readonly fields?: Record<string, FirestoreValue>;
   readonly name?: string;
+  // Firestore's per-document version. Passed back as a write precondition it
+  // becomes a compare-and-swap that holds on the single-document write path,
+  // independent of any transaction. Verified against the Firestore emulator:
+  // replaying a stale updateTime is refused with
+  //   400 {"error":{"code":400,"message":"the stored version (...) does not
+  //        match the required base version (...)","status":"FAILED_PRECONDITION"}}
+  readonly updateTime?: string;
 };
+
+// Whether a conditional write took effect. `precondition-failed` is a positive
+// statement that the document moved since it was read, so the caller must
+// re-read rather than retry the same write.
+export type FirestoreConditionalOutcome = "committed" | "precondition-failed";
 
 // One Firestore client for every collection this service touches, so the
 // metadata-server token is fetched and cached once rather than per store.
@@ -74,7 +97,16 @@ export class FirestoreClient {
       },
     );
     if (response.status === 409) {
-      return "duplicate";
+      // ALREADY_EXISTS and ABORTED are both 409. Reporting a contended write
+      // as a duplicate would be worse than a lost signup: "duplicate" is
+      // exactly the answer that tells a caller the address is already on the
+      // list, so inferring it from contention hands back an enumeration
+      // oracle that an attacker can trigger on demand by generating load.
+      const detail = await response.text().catch(() => "");
+      if (firestoreErrorIs(409, detail, "ALREADY_EXISTS")) {
+        return "duplicate";
+      }
+      throw new Error("Firestore create returned a conflict that is not ALREADY_EXISTS");
     }
     if (!response.ok) {
       throw new Error(`Firestore create failed: ${response.status}`);
@@ -122,7 +154,11 @@ export class FirestoreClient {
       throw new Error(`Firestore batchGet failed: ${response.status}`);
     }
     const results = (await response.json()) as readonly {
-      readonly found?: { readonly fields?: Record<string, FirestoreValue>; readonly name: string };
+      readonly found?: {
+        readonly fields?: Record<string, FirestoreValue>;
+        readonly name: string;
+        readonly updateTime?: string;
+      };
       readonly missing?: string;
     }[];
     if (!Array.isArray(results) || results.length !== names.length) {
@@ -137,7 +173,10 @@ export class FirestoreClient {
       if (entry.found === undefined || typeof entry.found.name !== "string") {
         throw new Error("Firestore batchGet returned an unreadable document");
       }
-      documents.set(entry.found.name, { fields: entry.found.fields });
+      documents.set(entry.found.name, {
+        fields: entry.found.fields,
+        updateTime: entry.found.updateTime,
+      });
     }
     for (const name of names) {
       if (!documents.has(name)) {
@@ -147,7 +186,8 @@ export class FirestoreClient {
     return documents;
   }
 
-  // Returns false ONLY for an outcome Firestore states did not happen.
+  // Returns `committed: false` ONLY for an outcome Firestore states did not
+  // happen.
   //
   // The distinction matters more than it looks. Returning false makes the
   // caller begin a fresh, non-idempotent transaction, so `false` is a claim
@@ -157,18 +197,26 @@ export class FirestoreClient {
   // us -- and treating that as "did not commit" is how a quota gets
   // double-spent or a confirmation reported as unwritten after it landed.
   // Ambiguity fails closed.
-  async commitTransaction(transaction: string, writes: readonly unknown[]): Promise<boolean> {
+  async commitTransaction(
+    transaction: string,
+    writes: readonly unknown[],
+  ): Promise<FirestoreCommitOutcome> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:commit`, {
       body: JSON.stringify({ transaction, writes }),
       headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
       method: "POST",
     });
-    if (response.ok) return true;
+    if (response.ok) {
+      return { committed: true, transformResults: await readTransformResults(response) };
+    }
     if (response.status === 409) {
-      // Validate the status rather than inferring it from the code alone: a
-      // 409 that is not an ABORTED is not a statement about the write.
+      // Decoded, not searched for. A substring test would also match the word
+      // ABORTED inside a message, inside an echoed resource name, or inside a
+      // proxy's HTML error page -- none of which are statements about the
+      // write. Observed shape, verbatim from the emulator:
+      //   {"error":{"code":409,"message":"Transaction lock timeout.","status":"ABORTED"}}
       const detail = await response.text().catch(() => "");
-      if (detail.includes("ABORTED")) return false;
+      if (firestoreErrorIs(409, detail, "ABORTED")) return { committed: false };
       throw new Error("Firestore transactional commit returned an unrecognised conflict");
     }
     throw new Error(`Firestore transactional commit failed: ${response.status}`);
@@ -183,6 +231,32 @@ export class FirestoreClient {
     // A rollback that fails changes nothing: the transaction expires on its
     // own and no write was ever committed under it.
     void response;
+  }
+
+  // Compare-and-swap without a transaction.
+  //
+  // Every write carries a `currentDocument.updateTime` precondition, so the
+  // swap is decided by the single-document write path rather than by
+  // transaction isolation. That matters because isolation is a cross-document
+  // guarantee this service cannot verify from outside, whereas the
+  // precondition is observable: a stale base version is refused outright.
+  async commitConditional(writes: readonly unknown[]): Promise<FirestoreConditionalOutcome> {
+    const response = await this.#fetch(`${this.documentsBaseUrl}:commit`, {
+      body: JSON.stringify({ writes }),
+      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      method: "POST",
+    });
+    if (response.ok) {
+      return "committed";
+    }
+    if (response.status === 400) {
+      const detail = await response.text().catch(() => "");
+      if (firestoreErrorIs(400, detail, "FAILED_PRECONDITION")) {
+        return "precondition-failed";
+      }
+      throw new Error("Firestore conditional commit rejected the request");
+    }
+    throw new Error(`Firestore conditional commit failed: ${response.status}`);
   }
 
   async commit(writes: readonly unknown[]): Promise<{
@@ -220,6 +294,44 @@ export class FirestoreClient {
     this.#token = { accessToken: token.access_token, expiresAt: now + token.expires_in * 1000 };
     return token.access_token;
   }
+}
+
+async function readTransformResults(
+  response: Response,
+): Promise<readonly (readonly FirestoreValue[])[]> {
+  // A commit whose result cannot be read is a commit whose effect cannot be
+  // checked. That is not treated as success-with-unknown-effect; the caller
+  // needs the transform values to enforce its bound, so an unreadable body is
+  // surfaced as an error rather than silently returning an empty list.
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error("Firestore commit returned an unreadable body");
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new Error("Firestore commit returned an unreadable body");
+  }
+  const writeResults = (body as { writeResults?: unknown }).writeResults;
+  if (writeResults === undefined) {
+    return [];
+  }
+  if (!Array.isArray(writeResults)) {
+    throw new Error("Firestore commit returned unreadable write results");
+  }
+  return writeResults.map((result) => {
+    if (typeof result !== "object" || result === null || Array.isArray(result)) {
+      throw new Error("Firestore commit returned an unreadable write result");
+    }
+    const transforms = (result as { transformResults?: unknown }).transformResults;
+    if (transforms === undefined) {
+      return [];
+    }
+    if (!Array.isArray(transforms)) {
+      throw new Error("Firestore commit returned unreadable transform results");
+    }
+    return transforms as readonly FirestoreValue[];
+  });
 }
 
 export function readString(value: FirestoreValue | undefined): string {

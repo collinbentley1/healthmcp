@@ -98,7 +98,16 @@ describe("waitlist", () => {
       expect(document.fields?.expiresAt?.timestampValue).toBe("2026-07-01T12:00:00.000Z");
       expect(document.fields?.confirmedAt).toBeUndefined();
       if (existing) {
-        return Response.json({ error: { status: "ALREADY_EXISTS" } }, { status: 409 });
+        // The exact payload Firestore returns, captured from the emulator.
+        // The `code` is part of it, and the parser insists on it: a body that
+        // omits the code is not a well-formed statement about the write.
+        return Response.json({
+          error: {
+            code: 409,
+            message: "entity already exists: EntityRef[partitionRef=dev~p, path=/waitlist/x]",
+            status: "ALREADY_EXISTS",
+          },
+        }, { status: 409 });
       }
       existing = true;
       return Response.json({ name: "stored" });
@@ -276,14 +285,14 @@ describe("waitlist confirmation concurrency", () => {
     // entry BEFORE either commits, which is the interleaving that read-then-
     // write cannot survive: without a compare-and-swap both would report
     // confirmed and the second subject would overwrite the first.
-    let version = 0;
+    let version = 1;
     let readers = 0;
     let releaseBarrier: () => void = () => {};
     const bothHaveRead = new Promise<void>((resolve) => {
       releaseBarrier = resolve;
     });
-    const readVersions = new Map<string, number>();
     const commits: string[] = [];
+    const versionStamp = (n: number) => `2026-09-01T12:00:0${n}.000000Z`;
     let record: Record<string, unknown> = {
       clientHash: "c".repeat(64),
       createdAt: "2026-09-01T12:00:00.000Z",
@@ -309,47 +318,59 @@ describe("waitlist confirmation concurrency", () => {
       if (url.includes("metadata.google.internal")) {
         return Response.json({ access_token: "token", expires_in: 3600 });
       }
-      if (url.endsWith(":beginTransaction")) {
+      if (!url.endsWith(":commit")) {
+        // A plain document read. Firestore returns the document's version
+        // alongside its fields, and that version is what the promotion below
+        // pins itself to.
         readers += 1;
-        return Response.json({ transaction: `txn-${readers}` });
-      }
-      if (url.endsWith(":batchGet")) {
-        const body = JSON.parse(String(init?.body)) as {
-          documents: string[];
-          transaction: string;
-        };
-        readVersions.set(body.transaction, version);
-        // Hold until both transactions have read the same pending state.
-        if (readVersions.size >= 2) releaseBarrier();
+        const observed = version;
+        // Hold until both readers have seen the same pending state.
+        if (readers >= 2) releaseBarrier();
         else await bothHaveRead;
-        return Response.json([{ found: { fields: toFields(), name: body.documents[0]! } }]);
+        return Response.json({
+          fields: toFields(),
+          name: url.split("/documents/")[1],
+          updateTime: versionStamp(observed),
+        });
       }
-      if (url.endsWith(":rollback")) return Response.json({});
       const body = JSON.parse(String(init?.body)) as {
-        transaction: string;
         writes: {
+          currentDocument?: { updateTime?: string };
           update: {
             fields: Record<string, { stringValue?: string; timestampValue?: string }>;
           };
         }[];
       };
-      if (readVersions.get(body.transaction) !== version) {
+      const write = body.writes[0]!;
+      // The compare-and-swap, exactly as Firestore performs it. A write whose
+      // required base version is not the stored version is refused; observed
+      // verbatim from the Firestore emulator:
+      //   400 {"error":{"code":400,"message":"the stored version (...) does
+      //        not match the required base version (...)",
+      //        "status":"FAILED_PRECONDITION"}}
+      if (write.currentDocument?.updateTime !== versionStamp(version)) {
         return Response.json(
-          { error: { code: 409, message: "contention", status: "ABORTED" } },
-          { status: 409 },
+          {
+            error: {
+              code: 400,
+              message: "the stored version (2) does not match the required base version (1)",
+              status: "FAILED_PRECONDITION",
+            },
+          },
+          { status: 400 },
         );
       }
       version += 1;
-      commits.push(body.transaction);
+      commits.push(String(write.currentDocument?.updateTime));
       // Firestore stores instants as timestampValue and text as stringValue;
       // a fixture that only reads one of them is not modelling the store.
       record = Object.fromEntries(
-        Object.entries(body.writes[0]!.update.fields).map(([key, value]) => [
+        Object.entries(write.update.fields).map(([key, value]) => [
           key,
           value.stringValue ?? value.timestampValue,
         ]),
       );
-      return Response.json({ writeResults: [{}] });
+      return Response.json({ writeResults: [{ updateTime: versionStamp(version) }] });
     };
 
     const store = new FirestoreWaitlistStore({

@@ -88,17 +88,36 @@ function firestoreFleet() {
           }
         }
         commits.push(body.writes);
-        for (const write of body.writes) {
+        // Faithful commit result. Firestore reports what each write did, and
+        // for an `increment` transform that report is the POST-increment
+        // value -- verified against the Firestore emulator, where three
+        // successive commits returned transformResults of 1, then 2, then 3.
+        // The quota's hard cap is enforced from these values, so a fixture
+        // that omitted them would be testing a weaker service than the one
+        // that ships.
+        const writeResults = body.writes.map((write) => {
           if (typeof write.delete === "string") {
             counters.delete(write.delete);
             versions.set(write.delete, versionOf(write.delete) + 1);
-            continue;
+            return { updateTime: "2026-09-01T00:00:00.000000Z" };
           }
           const name = (write.update as { name: string }).name;
-          counters.set(name, (counters.get(name) ?? 0) + 1);
           versions.set(name, versionOf(name) + 1);
-        }
-        return Response.json({ writeResults: body.writes.map(() => ({})) });
+          const transforms = (write.updateTransforms ?? []) as {
+            increment?: { integerValue: string };
+          }[];
+          if (transforms.length === 0) {
+            return { updateTime: "2026-09-01T00:00:00.000000Z" };
+          }
+          const transformResults = transforms.map((transform) => {
+            const by = Number(transform.increment?.integerValue ?? "0");
+            const next = (counters.get(name) ?? 0) + by;
+            counters.set(name, next);
+            return { integerValue: String(next) };
+          });
+          return { transformResults, updateTime: "2026-09-01T00:00:00.000000Z" };
+        });
+        return Response.json({ writeResults });
       }),
       projectId: "medlock-1025243085",
     });

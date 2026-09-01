@@ -1,4 +1,4 @@
-import type { FirestoreClient } from "./firestore.ts";
+import type { FirestoreClient, FirestoreValue } from "./firestore.ts";
 
 // The authoritative abuse control. It has to be authoritative because the
 // in-process limiter never was: Cloud Run runs many instances, each with its
@@ -23,6 +23,15 @@ export interface WaitlistQuota {
 
 const MAX_QUOTA_RULES = 8;
 const MAX_QUOTA_TRANSACTION_ATTEMPTS = 5;
+
+// An ABORTED arrives from Firestore as a LOCK TIMEOUT, not as a cheap
+// optimistic rejection -- observed verbatim against the emulator:
+//   409 {"error":{"code":409,"message":"Transaction lock timeout.","status":"ABORTED"}}
+// Retries therefore cost real wall-clock time, so a bounded attempt count is
+// not by itself a bound on latency. Without a deadline, contention becomes
+// both a latency amplifier and a timing channel: how long a rejection takes
+// would tell a caller how contended its own bucket is.
+const MAX_QUOTA_WALL_CLOCK_MS = 5_000;
 
 function assertRules(rules: readonly QuotaRule[]): void {
   if (rules.length < 1 || rules.length > MAX_QUOTA_RULES) {
@@ -63,10 +72,20 @@ function retryAfter(nowMs: number, windowSeconds: number): number {
 export class FirestoreWaitlistQuota implements WaitlistQuota {
   readonly #client: FirestoreClient;
   readonly #collection: string;
+  readonly #deadlineMs: number;
+  readonly #monotonicNow: () => number;
 
-  constructor(options: { client: FirestoreClient; collection: string }) {
+  constructor(options: {
+    client: FirestoreClient;
+    collection: string;
+    deadlineMs?: number;
+    monotonicNow?: () => number;
+  }) {
     this.#client = options.client;
     this.#collection = options.collection;
+    this.#deadlineMs = options.deadlineMs ?? MAX_QUOTA_WALL_CLOCK_MS;
+    // Monotonic: a wall clock that steps backwards would extend the budget.
+    this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
   }
 
   async consume(rules: readonly QuotaRule[], now: Date): Promise<QuotaDecision> {
@@ -85,11 +104,30 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
     // A read-judge-write transaction removes that: a refusal costs the narrow
     // bucket nothing and the global bucket nothing.
     //
-    // Firestore aborts the commit if any document the read touched changed
-    // underneath it, so two instances cannot both observe "one slot left" and
-    // both take it. An abort is retried; running out of retries fails closed.
+    // Two independent mechanisms, because they protect different things.
+    //
+    // The transaction provides FAIRNESS: a refusal is decided before any write,
+    // so a refused request spends no budget and one flooded bucket cannot drain
+    // a shared one.
+    //
+    // The increment transform's RETURN VALUE provides the SAFETY BOUND. The
+    // commit reports the post-increment count for every counter it advanced
+    // (verified against the Firestore emulator: successive commits returned
+    // transformResults of 1, then 2, then 3). Checking that value is what caps
+    // admissions, and it holds whatever the isolation level turns out to be:
+    // if two instances somehow both passed the read-judge with one slot left,
+    // their increments still return distinct values and the one that lands
+    // above the limit is refused. Safety therefore does not rest on any
+    // cross-document isolation guarantee, which is not a property this service
+    // can observe from outside.
     const names = rules.map((rule) => this.#documentName(rule.key, windowIndex(nowMs, rule.windowSeconds)));
+    const startedAt = this.#monotonicNow();
     for (let attempt = 1; attempt <= MAX_QUOTA_TRANSACTION_ATTEMPTS; attempt += 1) {
+      // Checked before each attempt, including the first, so a caller that is
+      // already out of budget never opens a transaction it cannot finish.
+      if (attempt > 1 && this.#monotonicNow() - startedAt >= this.#deadlineMs) {
+        throw new Error("Firestore waitlist quota exceeded its decision deadline");
+      }
       const transaction = await this.#client.beginTransaction();
       let decided: QuotaDecision | undefined;
       try {
@@ -141,7 +179,14 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
               delete: this.#documentName(rule.key, windowIndex(nowMs, rule.windowSeconds) - 2),
             });
           }
-          if (await this.#client.commitTransaction(transaction, writes)) {
+          const outcome = await this.#client.commitTransaction(transaction, writes);
+          if (outcome.committed) {
+            // The counters actually moved. Judge the authoritative post-
+            // increment values rather than the pre-read ones.
+            const overflow = firstOverflow(rules, outcome.transformResults, nowMs);
+            if (overflow !== undefined) {
+              return { allowed: false, retryAfterSeconds: overflow };
+            }
             return { allowed: true, retryAfterSeconds: 0 };
           }
           // Contention: somebody else moved a counter this decision was based
@@ -164,6 +209,42 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
   #documentName(key: string, index: number): string {
     return this.#client.documentName(this.#collection, `${key.replaceAll(":", "__")}--${index}`);
   }
+}
+
+// The authoritative cap. `results` are the post-increment counts Firestore
+// returned, positionally aligned with the increment writes, which are the
+// first `rules.length` writes in the commit.
+//
+// An unreadable result is not treated as "within budget": a commit whose
+// effect cannot be checked has to fail closed, because the increment has
+// already landed and nothing else will catch an overflow.
+function firstOverflow(
+  rules: readonly QuotaRule[],
+  results: readonly (readonly FirestoreValue[])[],
+  nowMs: number,
+): number | undefined {
+  if (results.length < rules.length) {
+    throw new Error("Firestore waitlist quota commit returned too few transform results");
+  }
+  let retryAfterSeconds: number | undefined;
+  rules.forEach((rule, position) => {
+    const transformed = results[position];
+    if (!Array.isArray(transformed) || transformed.length !== 1) {
+      throw new Error("Firestore waitlist quota commit returned an unusable transform result");
+    }
+    const value = transformed[0];
+    if (value === undefined || !("integerValue" in value)) {
+      throw new Error("Firestore waitlist quota commit returned a non-integer counter");
+    }
+    const count = Number(value.integerValue);
+    if (!Number.isSafeInteger(count) || count < 1) {
+      throw new Error("Firestore waitlist quota commit returned an out-of-range counter");
+    }
+    if (count > rule.limit) {
+      retryAfterSeconds = Math.max(retryAfterSeconds ?? 0, retryAfter(nowMs, rule.windowSeconds));
+    }
+  });
+  return retryAfterSeconds;
 }
 
 // Single-process stand-in with identical semantics, for local runs and tests.

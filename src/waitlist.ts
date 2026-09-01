@@ -63,7 +63,10 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export const PENDING_TTL_SECONDS = 30 * 24 * 60 * 60;
 // Far enough out that the TTL policy never reaps a confirmed member, while
 // leaving the field present so the policy still has something to read.
-export const CONFIRMED_EXPIRES_AT = "9999-12-31T23:59:59.000Z";
+export // Bounded so a hostile racer cannot hold a request open indefinitely.
+const MAX_CONFIRM_ATTEMPTS = 5;
+
+const CONFIRMED_EXPIRES_AT = "9999-12-31T23:59:59.000Z";
 
 export async function submitWaitlist(
   store: WaitlistStore,
@@ -295,51 +298,63 @@ export class FirestoreWaitlistStore implements WaitlistStore {
     return await this.#client.create(this.#collection, entry.emailHash, toFirestoreDocument(entry));
   }
 
-  // Single-use, decided by Firestore rather than by a read followed by a write.
-  // The transaction's read set is the entry itself, so a concurrent second
-  // confirmation aborts instead of promoting twice or clobbering the first
-  // subject.
+  // Single-use, enforced by a per-document compare-and-swap.
+  //
+  // This deliberately does NOT rely on transaction isolation. Isolation is a
+  // cross-document guarantee that this service cannot observe from outside,
+  // and a promotion is the one operation where being wrong hands somebody
+  // else's account away. Instead the entry is read, and the promotion carries
+  // the exact `updateTime` that read observed as a write precondition. If
+  // anything touched the entry in between -- a second confirmation, a racing
+  // subject, an administrative edit -- the stored version no longer matches
+  // the required base version and Firestore refuses the write outright.
+  //
+  // Verified against the Firestore emulator: replaying a stale updateTime is
+  // refused with FAILED_PRECONDITION and the document keeps its first value,
+  // so the first confirmation wins and the second cannot clobber its subject.
   async confirm(
     emailHash: string,
     subject: string,
     nowMs: number,
   ): Promise<WaitlistConfirmOutcome> {
     const name = this.#client.documentName(this.#collection, emailHash);
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
-      const transaction = await this.#client.beginTransaction();
-      try {
-        const documents = await this.#client.batchGet([name], transaction);
-        const document = documents.get(name);
-        if (document === undefined) {
-          await this.#client.rollback(transaction);
-          return "absent";
-        }
-        const entry = waitlistEntryFromUnknown(fromFirestoreDocument(document), emailHash);
-        if (entry.status === "confirmed") {
-          await this.#client.rollback(transaction);
-          return "already-confirmed";
-        }
-        if (Date.parse(entry.expiresAt) <= nowMs) {
-          await this.#client.rollback(transaction);
-          return "expired";
-        }
-        const committed = await this.#client.commitTransaction(transaction, [{
-          update: toFirestoreDocument({
-            ...entry,
-            confirmedAt: new Date(nowMs).toISOString(),
-            confirmedSubject: subject,
-            expiresAt: CONFIRMED_EXPIRES_AT,
-            status: "confirmed",
-          }, name),
-          updateMask: {
-            fieldPaths: ["confirmedAt", "confirmedSubject", "expiresAt", "status"],
-          },
-        }]);
-        if (committed) return "confirmed";
-      } catch (error) {
-        await this.#client.rollback(transaction);
-        throw error;
+    for (let attempt = 1; attempt <= MAX_CONFIRM_ATTEMPTS; attempt += 1) {
+      const document = await this.#client.get(this.#collection, emailHash);
+      if (document === undefined) {
+        return "absent";
       }
+      // A document with no version cannot be swapped safely, and promoting it
+      // unconditionally is exactly the read-then-blind-write this replaced.
+      const baseVersion = document.updateTime;
+      if (typeof baseVersion !== "string" || baseVersion.length === 0) {
+        throw new Error("Firestore waitlist entry has no version to compare against");
+      }
+      const entry = waitlistEntryFromUnknown(fromFirestoreDocument(document), emailHash);
+      if (entry.status === "confirmed") {
+        return "already-confirmed";
+      }
+      if (Date.parse(entry.expiresAt) <= nowMs) {
+        return "expired";
+      }
+      const outcome = await this.#client.commitConditional([{
+        currentDocument: { updateTime: baseVersion },
+        update: toFirestoreDocument({
+          ...entry,
+          confirmedAt: new Date(nowMs).toISOString(),
+          confirmedSubject: subject,
+          expiresAt: CONFIRMED_EXPIRES_AT,
+          status: "confirmed",
+        }, name),
+        updateMask: {
+          fieldPaths: ["confirmedAt", "confirmedSubject", "expiresAt", "status"],
+        },
+      }]);
+      if (outcome === "committed") {
+        return "confirmed";
+      }
+      // The entry moved. Re-read and re-judge; the next pass observes whatever
+      // the winner wrote, which is how a second confirmation reports
+      // "already-confirmed" rather than promoting twice.
     }
     // Never guess at membership state.
     throw new Error("Firestore waitlist confirmation could not commit");
