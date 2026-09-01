@@ -174,7 +174,9 @@ describe("waitlist confirmation", () => {
   });
 
   test("the file store promotes and replays identically", async () => {
-    const directory = `/tmp/medlock-confirm-${Bun.hash(String(AT))}`;
+    // Unique per run: a fixed path would carry a previous run's confirmed
+    // entry forward and make the first promotion report already-confirmed.
+    const directory = `/tmp/medlock-confirm-${crypto.randomUUID()}`;
     const store = new FileWaitlistStore(directory);
     await submitWaitlist(store, { clientId: "c", email: "confirm@example.com" }, new Date(AT));
 
