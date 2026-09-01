@@ -373,6 +373,7 @@ describe("server", () => {
       confirm: () => Promise.reject(new Error("private waitlist marker")),
       create: () => Promise.reject(new Error("private waitlist marker")),
       pendingExists: () => Promise.reject(new Error("private waitlist marker")),
+      emailFor: () => Promise.reject(new Error("private waitlist marker")),
     };
     const response = await createHandler({ config, waitlistStore: throwingStore })(
       new Request("http://localhost/api/waitlist", {

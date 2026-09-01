@@ -54,19 +54,38 @@ export type WaitlistStore = {
   // record would put the stored address, its creation time, and its client
   // hash within reach of a request path that has no use for them.
   pendingExists(emailHash: string, nowMs: number): Promise<boolean>;
+  // The address behind a hash, but only while a live pending entry holds it.
+  //
+  // The exchange needs the plaintext address because
+  // `accounts:signInWithEmailLink` requires it alongside the oobCode. That is
+  // the only reason this exists, so it is scoped to exactly that case: a
+  // confirmed, expired, absent, or malformed entry yields undefined, and no
+  // caller can use it to walk the collection.
+  emailFor(emailHash: string, nowMs: number): Promise<string | undefined>;
 };
 
 // One judgement of "live and pending", shared by every backend so they cannot
 // disagree. A record that does not validate is not pending: a corrupt entry
 // must not become a reason to send mail.
-function entryIsPending(stored: unknown, emailHash: string, nowMs: number): boolean {
+function livePendingEntry(
+  stored: unknown,
+  emailHash: string,
+  nowMs: number,
+): WaitlistEntry | undefined {
   let entry;
   try {
     entry = waitlistEntryFromUnknown(stored, emailHash);
   } catch {
-    return false;
+    return undefined;
   }
-  return entry.status === "pending" && Date.parse(entry.expiresAt) > nowMs;
+  if (entry.status !== "pending" || Date.parse(entry.expiresAt) <= nowMs) {
+    return undefined;
+  }
+  return entry;
+}
+
+function entryIsPending(stored: unknown, emailHash: string, nowMs: number): boolean {
+  return livePendingEntry(stored, emailHash, nowMs) !== undefined;
 }
 
 export type WaitlistSubmission = {
@@ -248,6 +267,10 @@ export class MemoryWaitlistStore implements WaitlistStore {
     return entryIsPending(this.#entries.get(emailHash), emailHash, nowMs);
   }
 
+  async emailFor(emailHash: string, nowMs: number): Promise<string | undefined> {
+    return livePendingEntry(this.#entries.get(emailHash), emailHash, nowMs)?.email;
+  }
+
   // Test-only inspection. Never reachable from a request path.
   peek(emailHash: string): WaitlistEntry | undefined {
     return this.#entries.get(emailHash);
@@ -296,6 +319,10 @@ export class FileWaitlistStore implements WaitlistStore {
 
   async pendingExists(emailHash: string, nowMs: number): Promise<boolean> {
     return entryIsPending(await this.read(emailHash), emailHash, nowMs);
+  }
+
+  async emailFor(emailHash: string, nowMs: number): Promise<string | undefined> {
+    return livePendingEntry(await this.read(emailHash), emailHash, nowMs)?.email;
   }
 
   async read(emailHash: string): Promise<WaitlistEntry | undefined> {
@@ -393,6 +420,12 @@ export class FirestoreWaitlistStore implements WaitlistStore {
     const document = await this.#client.get(this.#collection, emailHash);
     if (document === undefined) return false;
     return entryIsPending(fromFirestoreDocument(document), emailHash, nowMs);
+  }
+
+  async emailFor(emailHash: string, nowMs: number): Promise<string | undefined> {
+    const document = await this.#client.get(this.#collection, emailHash);
+    if (document === undefined) return undefined;
+    return livePendingEntry(fromFirestoreDocument(document), emailHash, nowMs)?.email;
   }
 
   async read(emailHash: string): Promise<WaitlistEntry | undefined> {

@@ -15,6 +15,7 @@ export type RuntimeConfig = {
   // than guessing at an audience.
   readonly identityPlatformAudience: string | undefined;
   readonly identityPlatformContinueUrl: string | undefined;
+  readonly waitlistActivationEnabled: boolean;
   readonly legacyHosts: readonly string[];
   readonly mcpBearerToken: string | undefined;
   readonly port: number;
@@ -89,6 +90,7 @@ export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.e
     port: Number(env.PORT ?? 3000),
     publicDir: env.PUBLIC_DIR ?? (import.meta.dir.endsWith("/dist") ? BUILT_PUBLIC_DIR : SOURCE_PUBLIC_DIR),
     version: env.MEDLOCK_VERSION ?? "0.2.0",
+    waitlistActivationEnabled: parseActivationEnabled(env.WAITLIST_ACTIVATION_ENABLED),
     waitlistBackend,
     waitlistIdentitySecrets,
   };
@@ -184,6 +186,23 @@ function present(value: string | undefined): string | undefined {
 // Platform will send to a mailbox, so it is validated rather than trusted: an
 // attacker-supplied continue URL would turn the ownership mail into an open
 // redirect carrying a single-use credential in its query string.
+// The ownership flow stays off until it has been proved end to end against the
+// live service.
+//
+// Every other piece can be verified locally, but the one thing that cannot is
+// whether a real mailed oobCode exchanges for a real ID token against the
+// enabled API. Until that has been observed, promotion must not be reachable in
+// production -- so this defaults to off and has to be turned on deliberately.
+// An unrecognised value is refused rather than read as off, because a silent
+// default is exactly how a flag meant to be temporary becomes permanent.
+function parseActivationEnabled(value: string | undefined): boolean {
+  const raw = present(value);
+  if (raw === undefined) return false;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new Error("WAITLIST_ACTIVATION_ENABLED must be exactly true or false.");
+}
+
 function parseContinueUrl(value: string | undefined): string | undefined {
   const raw = present(value);
   if (raw === undefined) return undefined;

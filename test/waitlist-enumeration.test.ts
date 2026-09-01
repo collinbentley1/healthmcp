@@ -108,6 +108,7 @@ describe("waitlist enumeration", () => {
       waitlistStore: {
         confirm: async (...args) => await store.confirm(...args),
         pendingExists: async (...args) => await store.pendingExists(...args),
+        emailFor: async (...args) => await store.emailFor(...args),
         create: async (entry) => {
           const outcome = await store.create(entry);
           // Only the create path does real work.
@@ -389,6 +390,17 @@ describe("waitlist activation", () => {
     ALLOWED_ORIGINS: "http://localhost:3000",
     DATA_DIR: "/tmp/medlock-activation-test",
     IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085",
+    // Explicit. Promotion is unreachable until the mailed oobCode exchange has
+    // been proved against the live service, so these tests have to opt in the
+    // same way a deployment would.
+    WAITLIST_ACTIVATION_ENABLED: "true",
+    WAITLIST_BACKEND: "memory",
+  });
+  // Everything provisioned EXCEPT the flag: this is the production posture.
+  const provisionedButNotEnabled = getRuntimeConfig({
+    ALLOWED_ORIGINS: "http://localhost:3000",
+    DATA_DIR: "/tmp/medlock-activation-test",
+    IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085",
     WAITLIST_BACKEND: "memory",
   });
   const seeded = async () => {
@@ -407,6 +419,37 @@ describe("waitlist activation", () => {
     );
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: "waitlist activation is not available" });
+  });
+
+  // The state production actually ships in.
+  test("a fully provisioned deployment still refuses until activation is enabled", async () => {
+    const response = await createHandler({
+      config: provisionedButNotEnabled,
+      identityVerifier: { verify: async () => ({
+        email: "member@example.com",
+        expiresAtMs: 0,
+        issuedAtMs: 0,
+        subject: "s",
+      }) },
+      waitlistStore: new MemoryWaitlistStore(),
+    })(activationPost("a.valid.token"));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "waitlist activation is not available" });
+  });
+
+  // Surrounding whitespace is trimmed, as it is for every other setting; a
+  // value that merely resembles "true" is refused rather than guessed at.
+  test("the enabling flag is not inferred from something true-ish", () => {
+    for (const value of ["TRUE", "True", "1", "yes", "on", "enabled"]) {
+      expect(() =>
+        getRuntimeConfig({
+          ALLOWED_ORIGINS: "http://localhost:3000",
+          DATA_DIR: "/tmp/medlock-activation-test",
+          WAITLIST_ACTIVATION_ENABLED: value,
+          WAITLIST_BACKEND: "memory",
+        })
+      ).toThrow(/exactly true or false/);
+    }
   });
 
   test("a verified token promotes exactly one pending entry", async () => {

@@ -48,10 +48,16 @@ async function seeded(): Promise<{ store: MemoryWaitlistStore; member: string }>
 
 function dispatcherSpy(behaviour: "ok" | "throw" = "ok") {
   const sent: string[] = [];
+  const links: string[] = [];
   return {
+    links,
     sent,
-    sendSignInLink: async (email: string) => {
+    exchangeSignInLink: async () => {
+      throw new Error("exchange not exercised by these tests");
+    },
+    sendSignInLink: async (email: string, emailHash: string) => {
       sent.push(email);
+      links.push(emailHash);
       if (behaviour === "throw") throw new Error("smtp exploded");
     },
   };
@@ -111,6 +117,7 @@ describe("challenge dispatch is not a mail relay", () => {
     const corrupting: WaitlistStore = {
       confirm: (...args) => store.confirm(...args),
       create: (entry) => store.create(entry),
+      emailFor: (hash, nowMs) => store.emailFor(hash, nowMs),
       pendingExists: (hash, nowMs) =>
         store.pendingExists(hash, nowMs).then(() => {
           throw new Error("corrupt record");
@@ -164,6 +171,9 @@ describe("challenge dispatch answers no membership question", () => {
     const handler = createHandler({
       config: PROVISIONED,
       identityDispatcher: {
+        exchangeSignInLink: async () => {
+          throw new Error("exchange not exercised by this test");
+        },
         sendSignInLink: async () => {
           // Sending costs real time; the pad has to absorb it.
           monotonic += 40;

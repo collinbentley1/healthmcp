@@ -5,9 +5,16 @@ exact API call, the exact permission, the principal that needs it, and how the
 grant is verified afterwards. All observations were taken read-only against
 project `medlock-1025243085` on 2026-09-01.
 
-The HealthMCP side of each item is already implemented and merged into this
-branch; these are the grants that turn declared configuration into enforced
-configuration.
+The HealthMCP side of each item is implemented on this branch. **The platform
+side is implemented too**, on the `security/federation-quarantine-rebuild`
+branch in the platform repository: `identitytoolkit.googleapis.com` is enabled
+through `required_services`, the protected apply role gains the three Firestore
+TTL permissions behind a `manage_firestore_field_ttl` flag scoped to Medlock,
+and the runtime gains a single-permission `waitlistChallengeSender` custom role.
+Neither branch is pushed; both are staged for review.
+
+What remains after review is an apply and one live end-to-end proof, described
+under "Activation remains off until proved live".
 
 ---
 
@@ -150,34 +157,72 @@ single permissions rather than by taking the predefined role.
 
 ### No API key, deliberately
 
-There is no browser API key in this design and none should be created. A public
-key makes `sendOobCode` callable by anyone who reads the page, for any address
--- an open mail relay pointed at strangers and charged to this domain's sending
-reputation. Referrer restrictions do not fix it; they are a browser convention,
-not an authorization boundary. Dispatch runs server-side under the runtime
-identity, behind the shared quota and a membership check.
+There is no Firebase API key in this design -- not in a browser, not in Secret
+Manager -- and none should be created. A public key makes `sendOobCode`
+callable by anyone who reads the page, for any address: an open mail relay
+pointed at strangers and charged to this domain's sending reputation. Referrer
+restrictions do not fix it; they are a browser convention, not an authorization
+boundary. Both legs run server-side under the runtime identity with short-lived
+bearer tokens, behind the shared quota and a membership check.
 
-### Still open: the exchange leg
+Note that provisioning Identity Platform may cause Google to auto-create a
+"Browser key (auto created by Firebase)". Nothing in this design uses or
+publishes it. Confirm after enablement that it is either deleted or restricted,
+and that no key is referenced from any served page.
 
-Dispatch and activation are implemented and tested. The middle step -- turning
-the `oobCode` from the mailed link into an ID token -- is **not** implemented,
-and this is the one part of the campaign that is not merely awaiting a grant.
+### The exchange is keyless, and that is now settled
 
-The standard client-side exchange (`accounts:signInWithEmailLink` with a public
-API key) is exactly the surface rejected above. Two viable alternatives:
+The middle leg -- turning the `oobCode` from a mailed link into an ID token --
+is implemented. It does **not** use a Firebase API key, public or server-held.
 
-1. **Project-scoped admin exchange** under the runtime bearer token, mirroring
-   dispatch. Preferred if it exists; its wire contract cannot be confirmed while
-   the API is disabled.
-2. **Server-held API key** in Secret Manager, used only from the backend and
-   never served to a browser. Works for certain, but introduces a credential to
-   store and rotate.
+The Identity Toolkit discovery document is authoritative on this and needs
+nothing enabled to read:
 
-Resolve by enabling the API and probing (1) before committing to (2). Until then
-activation correctly returns 503 and no address can reach `confirmed`.
+```
+accounts.signInWithEmailLink
+  path   : v1/accounts:signInWithEmailLink
+  scopes : ['https://www.googleapis.com/auth/cloud-platform']
+  request: { email (required), oobCode (required), idToken?, tenantId? }
+```
 
-Staging any resulting secret is the owner's action, not something this workflow
-performs.
+An OAuth2 `cloud-platform` scope means a short-lived service-account bearer
+token is accepted, so no long-lived key needs to exist. The service calls the
+endpoint with the runtime identity's metadata-server token, exactly as dispatch
+does.
+
+Two properties of the response are load-bearing and are enforced:
+
+- MFA returns `mfaPendingCredential` and **no** `idToken`. That is not a partial
+  success to route around; nothing has been proved, and the exchange refuses.
+- `isNewUser` shows that a successful exchange **creates** an Identity Platform
+  account. The runtime is deliberately granted only `firebaseauth.users.sendEmail`
+  and not `users.create`. If the live service turns out to require more, the
+  exchange fails closed and the requirement is observed rather than guessed --
+  which is why activation stays gated below.
+
+### Activation remains off until proved live
+
+`WAITLIST_ACTIVATION_ENABLED` defaults to false and Terraform does not set it.
+With every other piece provisioned, `/api/waitlist/confirm` and
+`/api/waitlist/activate` both return 503 and no address can reach `confirmed`.
+
+The remaining live step, in order:
+
+1. Merge and apply so `identitytoolkit.googleapis.com` is enabled and
+   `google_identity_platform_config` exists.
+2. Confirm the runtime's permission is sufficient:
+   ```bash
+   gcloud projects test-iam-permissions medlock-1025243085 \
+     --permissions=firebaseauth.users.sendEmail
+   ```
+3. Submit a real address, receive the mailed link, and let it exchange. Watch
+   for a 403 naming a permission the runtime lacks -- most plausibly
+   `firebaseauth.users.create`, given `isNewUser`.
+4. Only once an address has reached `confirmed` end to end, set
+   `WAITLIST_ACTIVATION_ENABLED=true` in a reviewed change.
+
+Until step 4, production is fail-closed by construction rather than by
+convention.
 
 ---
 

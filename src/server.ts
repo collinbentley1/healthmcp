@@ -29,11 +29,17 @@ type ServerDependencies = {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly monotonicNow?: () => number;
   readonly identityVerifier?: { verify: IdentityTokenVerifier["verify"] };
-  readonly identityDispatcher?: { sendSignInLink: IdentityPlatformClient["sendSignInLink"] };
+  readonly identityDispatcher?: {
+    exchangeSignInLink: IdentityPlatformClient["exchangeSignInLink"];
+    sendSignInLink: IdentityPlatformClient["sendSignInLink"];
+  };
 };
 
 export const MAX_REQUEST_BODY_SIZE = 1_048_576;
 const MAX_WAITLIST_BODY_SIZE = 8_192;
+// Identity Platform oobCodes are far shorter than this; the bound exists so a
+// megabyte of query string is refused before it is pattern-matched.
+const MAX_OOB_CODE_LENGTH = 512;
 
 // Every answer this endpoint can give about a submitted address is the same
 // answer, so the floor only has to hide the difference in work between
@@ -173,6 +179,23 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           waitlistQuota,
           rateLimiter,
           identityDispatcher,
+          waitlistIdentitySecrets,
+          now,
+          sleep,
+          monotonicNow,
+        );
+      }
+
+      if (url.pathname === "/api/waitlist/confirm") {
+        return await handleWaitlistConfirm(
+          request,
+          url,
+          config,
+          waitlistStore,
+          waitlistQuota,
+          rateLimiter,
+          identityDispatcher,
+          identityVerifier,
           waitlistIdentitySecrets,
           now,
           sleep,
@@ -527,9 +550,10 @@ async function handleWaitlistChallenge(
   };
 
   const nowMs = now().getTime();
+  const emailHash = sha256(normalized);
   try {
-    if (await store.pendingExists(sha256(normalized), nowMs)) {
-      await dispatcher.sendSignInLink(normalized, nowMs);
+    if (await store.pendingExists(emailHash, nowMs)) {
+      await dispatcher.sendSignInLink(normalized, emailHash, nowMs);
     }
   } catch {
     // Swallowed on purpose. Whether a send was attempted, and whether it
@@ -539,6 +563,148 @@ async function handleWaitlistChallenge(
     // verified token, which only a real delivery can produce.
   }
   return await settle(apiJson({ ok: true }, request, config, { status: 202 }));
+}
+
+// Exchange: turning a mailed link into a proved address.
+//
+// The link lands here with the entry's hash (placed there at dispatch) and the
+// oobCode Identity Platform generated. The oobCode is exchanged for an ID
+// token, the token is verified independently, and only an address that survives
+// both is promoted.
+//
+// The exchange is keyless. `accounts:signInWithEmailLink` declares OAuth2
+// `cloud-platform` in the Identity Toolkit discovery document, so a short-lived
+// service-account bearer token is enough and no Firebase API key -- public or
+// server-held -- exists anywhere in this flow.
+//
+// Every failure returns the same bytes and the same status. That is what keeps
+// `h` from being probeable: without it, an attacker could submit the hash of an
+// address they are curious about with a junk oobCode and tell "no such entry"
+// apart from "wrong code". Success is allowed to differ, because reaching it
+// requires an oobCode that only the mailbox ever held.
+async function handleWaitlistConfirm(
+  request: Request,
+  url: URL,
+  config: RuntimeConfig,
+  store: WaitlistStore,
+  quota: WaitlistQuota,
+  rateLimiter: InMemoryRateLimiter,
+  dispatcher: { exchangeSignInLink: IdentityPlatformClient["exchangeSignInLink"] } | undefined,
+  verifier: { verify: IdentityTokenVerifier["verify"] } | undefined,
+  identitySecrets: readonly Uint8Array[],
+  now: () => Date,
+  sleep: (ms: number) => Promise<void>,
+  monotonicNow: () => number,
+): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return withSecurityHeaders(
+      new Response(null, { headers: corsHeaders(request, config), status: 204 }),
+    );
+  }
+  if (request.method !== "GET" && request.method !== "POST") {
+    return apiJson({ error: "method not allowed" }, request, config, {
+      headers: { Allow: "GET, POST, OPTIONS" },
+      status: 405,
+    });
+  }
+  if (dispatcher === undefined || verifier === undefined || !config.waitlistActivationEnabled) {
+    return apiJson({ error: "waitlist verification is not available" }, request, config, {
+      status: 503,
+    });
+  }
+
+  const client = resolveWaitlistClient(request, identitySecrets);
+  const respond = (response: Response): Response =>
+    withWaitlistClientCookie(response, client.setCookie);
+
+  const local = rateLimiter.checkMany([
+    { key: `waitlist:client:${client.id}`, limit: WAITLIST_QUOTA_LIMITS.client.limit, windowMs: 60_000 },
+    { key: "waitlist:global", limit: WAITLIST_QUOTA_LIMITS.global.limit, windowMs: 60_000 },
+  ]);
+  if (!local.allowed) {
+    const response = rateLimitedWaitlistResponse(request, config, local.retryAfterSeconds);
+    return client.authenticated ? respond(response) : response;
+  }
+
+  const emailHash = url.searchParams.get("h") ?? "";
+  const oobCode = url.searchParams.get("oobCode") ?? "";
+
+  const quotaRules: QuotaRule[] = [
+    {
+      key: "waitlist:global",
+      limit: WAITLIST_QUOTA_LIMITS.global.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+    },
+    client.authenticated
+      ? {
+        key: `waitlist:client:${client.id.toLowerCase()}`,
+        limit: WAITLIST_QUOTA_LIMITS.client.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+      }
+      : {
+        key: "waitlist:unestablished",
+        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
+      },
+  ];
+  let decision;
+  try {
+    decision = await quota.consume(quotaRules, now());
+  } catch {
+    return respond(apiJson({ error: "service unavailable" }, request, config, { status: 503 }));
+  }
+  if (!decision.allowed) {
+    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+    return client.authenticated ? respond(response) : response;
+  }
+
+  const startedAt = monotonicNow();
+  const settle = async (response: Response): Promise<Response> => {
+    const elapsed = monotonicNow() - startedAt;
+    const target = WAITLIST_TIMING_FLOOR_MS + waitlistTimingJitterMs();
+    if (elapsed < target) await sleep(target - elapsed);
+    return respond(response);
+  };
+  // One refusal, used for every way this can fail.
+  const refuse = () =>
+    settle(
+      apiJson({ error: "verification link is invalid or has expired" }, request, config, {
+        status: 400,
+      }),
+    );
+
+  // Shape-checked before anything is looked up, so a malformed parameter costs
+  // no work and is indistinguishable from a well-formed one that misses.
+  if (!/^[0-9a-f]{64}$/.test(emailHash)) return await refuse();
+  if (oobCode.length === 0 || oobCode.length > MAX_OOB_CODE_LENGTH) return await refuse();
+  if (!/^[A-Za-z0-9._~-]+$/.test(oobCode)) return await refuse();
+
+  const nowMs = now().getTime();
+  try {
+    const email = await store.emailFor(emailHash, nowMs);
+    if (email === undefined) return await refuse();
+
+    const idToken = await dispatcher.exchangeSignInLink(email, oobCode, nowMs);
+    // Verified independently of the exchange. The exchange proves Identity
+    // Platform accepted the code; the verifier proves the token is genuinely
+    // this project's, carries a verified address, and was authenticated
+    // recently enough to promote on.
+    const identity = await verifier.verify(idToken, nowMs);
+    // And the address it proves must be the one this link was issued for.
+    if (sha256(identity.email) !== emailHash) return await refuse();
+
+    const outcome = await store.confirm(emailHash, identity.subject, nowMs);
+    if (outcome !== "confirmed" && outcome !== "already-confirmed") {
+      return await refuse();
+    }
+    // A replayed link reports the same thing as the first use. The promotion
+    // itself is single-use; saying so twice is not.
+    return await settle(apiJson({ ok: true, status: "confirmed" }, request, config, { status: 200 }));
+  } catch {
+    // Exchange rejected, token unverifiable, store unreachable -- all the same
+    // answer. Distinguishing them here is what would make `h` probeable.
+    return await refuse();
+  }
 }
 
 // Activation: the second half of the ownership flow.
@@ -567,9 +733,10 @@ async function handleWaitlistActivation(
       status: 405,
     });
   }
-  if (verifier === undefined) {
-    // Fail closed: no audience configured means no token can be trusted, and
-    // an activation that cannot verify must not activate.
+  if (verifier === undefined || !config.waitlistActivationEnabled) {
+    // Fail closed twice over. No audience means no token can be trusted; and
+    // even with one configured, promotion stays unreachable until the mailed
+    // oobCode exchange has been proved end to end against the live service.
     return apiJson({ error: "waitlist activation is not available" }, request, config, {
       status: 503,
     });

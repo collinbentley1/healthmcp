@@ -100,22 +100,60 @@ await requireContains(
 // who reads the page, turning the project into a mail relay aimed at strangers.
 // Dispatching without a membership check would do the same thing from the
 // server side.
+// What separates the safe surface from the dangerous one is the CREDENTIAL, not
+// the URL shape. `accounts:signInWithEmailLink` is unscoped but declares OAuth2
+// cloud-platform in the Identity Toolkit discovery document, so it is reached
+// with a short-lived service-account bearer. What must never appear is an API
+// key: a key that reaches a browser can be lifted out and replayed against
+// sendOobCode for arbitrary addresses.
 for (const path of ["src/identity-platform.ts", "src/server.ts", "infra/terraform/prod/main.tf"]) {
-  await rejectContains(
-    path,
-    "identitytoolkit.googleapis.com/v1/accounts",
-    "Challenge dispatch must use the project-scoped admin endpoint, never the API-key surface.",
-  );
-  await rejectContains(
-    path,
-    "key=",
-    "No Identity Platform API key may appear anywhere in the ownership flow.",
-  );
+  for (const forbidden of ["key=", "apiKey", "api_key", "browser_key", "google_apikeys_key"]) {
+    await rejectContains(
+      path,
+      forbidden,
+      "No Identity Platform API key may appear anywhere in the ownership flow.",
+    );
+  }
 }
+// Dispatch names the project explicitly; only the admin surface accepts that.
+await requireContains(
+  "src/identity-platform.ts",
+  "/accounts:sendOobCode",
+  "Challenge dispatch must use the project-scoped admin sendOobCode endpoint.",
+);
+await requireContains(
+  "src/identity-platform.ts",
+  "v1/projects/${",
+  "Challenge dispatch must address the project-scoped endpoint, not the unscoped one.",
+);
+// And every call to Identity Platform authenticates with a bearer token.
+await requireContains(
+  "src/identity-platform.ts",
+  "Authorization: `Bearer ${await this.#accessToken(nowMs)}`",
+  "Identity Platform calls must authenticate with a short-lived service-account bearer token.",
+);
 await requireContains(
   "src/server.ts",
-  "if (await store.pendingExists(sha256(normalized), nowMs)) {",
+  "if (await store.pendingExists(emailHash, nowMs)) {",
   "A sign-in link may only be dispatched to an address with a live pending entry.",
+);
+// The exchange promotes nobody unless the token it verified names the same
+// address the link was issued for.
+await requireContains(
+  "src/server.ts",
+  "if (sha256(identity.email) !== emailHash) return await refuse();",
+  "The exchange must bind the verified identity to the entry the link was issued for.",
+);
+// Promotion stays unreachable until the live exchange has been proved.
+await requireContains(
+  "src/server.ts",
+  "!config.waitlistActivationEnabled",
+  "Activation must remain gated until the mailed oobCode exchange is proved end to end.",
+);
+await rejectContains(
+  "infra/terraform/prod/main.tf",
+  "WAITLIST_ACTIVATION_ENABLED",
+  "Production must not enable activation before the live exchange has been proved.",
 );
 await requireContains(
   "infra/terraform/prod/main.tf",
