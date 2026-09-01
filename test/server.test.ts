@@ -174,32 +174,38 @@ describe("server", () => {
   test("accepts waitlist JSON and ignores spoofed forwarding headers when rate limiting", async () => {
     const handler = createHandler({
       config,
+      sleep: async () => {},
       waitlistIdentitySecrets: [new Uint8Array(32).fill(7)],
       waitlistStore: new MemoryWaitlistStore(),
     });
     let requestIndex = 0;
-    const request = (cookie?: string) =>
-      new Request("http://localhost/api/waitlist", {
-        body: JSON.stringify({ email: "person@example.com" }),
+    const request = (cookie?: string) => {
+      const index = requestIndex++;
+      return new Request("http://localhost/api/waitlist", {
+        body: JSON.stringify({ email: `person-${index}@example.com` }),
         headers: {
           ...(cookie ? { Cookie: cookie } : {}),
           "Content-Type": "application/json",
-          "X-Forwarded-For": `203.0.113.${requestIndex++}`,
+          // A header the caller controls. It must buy nothing: the budget is
+          // keyed on the signed client cookie and the shared buckets, never on
+          // a forwarding header, so rotating it cannot widen the allowance.
+          "X-Forwarded-For": `203.0.113.${index}`,
         },
         method: "POST",
       });
+    };
 
     const response = await handler(request());
     const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ duplicate: false, ok: true });
+    expect(await response.json()).toEqual({ ok: true });
     expect(cookie).toStartWith("medlock_waitlist_client=");
 
     for (let index = 0; index < 4; index += 1) {
-      const duplicate = await handler(request(cookie));
-      expect(duplicate.status).toBe(202);
-      expect(await duplicate.json()).toEqual({ duplicate: true, ok: true });
-      expect(duplicate.headers.get("set-cookie")).toBeNull();
+      const next = await handler(request(cookie));
+      expect(next.status).toBe(202);
+      expect(await next.json()).toEqual({ ok: true });
+      expect(next.headers.get("set-cookie")).toBeNull();
     }
 
     expect((await handler(request(cookie))).status).toBe(429);
@@ -226,7 +232,7 @@ describe("server", () => {
 
       for (let index = 0; index < 4; index += 1) {
         const response = await fetch(new URL("/api/waitlist", server.url), {
-          body: JSON.stringify({ email: "first@example.com" }),
+          body: JSON.stringify({ email: `first-${index}@example.com` }),
           headers: {
             Cookie: firstCookie!,
             "Content-Type": "application/json",
@@ -240,7 +246,7 @@ describe("server", () => {
       expect(
         (
           await fetch(new URL("/api/waitlist", server.url), {
-            body: JSON.stringify({ email: "first@example.com" }),
+            body: JSON.stringify({ email: "first-spill@example.com" }),
             headers: { Cookie: firstCookie!, "Content-Type": "application/json" },
             method: "POST",
           })
@@ -265,6 +271,7 @@ describe("server", () => {
   test("caps cookie-discarding callers before they can rotate through the global budget", async () => {
     const handler = createHandler({
       config,
+      sleep: async () => {},
       waitlistIdentitySecrets: [new Uint8Array(32).fill(9)],
       waitlistStore: new MemoryWaitlistStore(),
     });
@@ -288,6 +295,7 @@ describe("server", () => {
     const identitySecret = new Uint8Array(32).fill(10);
     const handler = createHandler({
       config,
+      sleep: async () => {},
       waitlistIdentitySecrets: [identitySecret],
       waitlistStore: new MemoryWaitlistStore(),
     });
@@ -362,8 +370,7 @@ describe("server", () => {
 
   test("keeps waitlist store failures inside the hardened API boundary", async () => {
     const throwingStore: WaitlistStore = {
-      get: () => Promise.reject(new Error("private waitlist marker")),
-      put: () => Promise.reject(new Error("private waitlist marker")),
+      create: () => Promise.reject(new Error("private waitlist marker")),
     };
     const response = await createHandler({ config, waitlistStore: throwingStore })(
       new Request("http://localhost/api/waitlist", {

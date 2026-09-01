@@ -49,8 +49,39 @@ await requireContains(
 );
 await requireContains(
   "src/server.ts",
-  "rateLimiter.checkMany(rules)",
+  "rateLimiter.checkMany(localRules)",
   "Waitlist client, establishment, and global rate limits must commit atomically.",
+);
+// The in-process limiter above is per-instance and so can only ever be a first
+// pass. The decision that actually bounds abuse is the shared one, and it has
+// to be a single atomic call for the same reason the local one does.
+await requireContains(
+  "src/server.ts",
+  "quota.consume(quotaRules, now())",
+  "The authoritative waitlist quota must commit every bucket in one atomic call.",
+);
+await requireContains(
+  "src/waitlist.ts",
+  'flag: "wx"',
+  "The file waitlist store must create-if-absent rather than read then write.",
+);
+await requireContains(
+  "src/firestore.ts",
+  "response.status === 409",
+  "Firestore waitlist creation must let the server decide existence, via 409.",
+);
+// F-02. Whether an address was already present is internal state. Publishing it
+// anywhere a caller can see -- a body field, a status, a header, or a message on
+// the page -- rebuilds the enumeration oracle.
+await rejectContains(
+  "src/server.ts",
+  "duplicate",
+  "The waitlist response must not disclose whether an address was already present.",
+);
+await rejectContains(
+  "src/client.ts",
+  "duplicate",
+  "The waitlist form must not disclose whether an address was already present.",
 );
 await requireContains(
   "src/config.ts",

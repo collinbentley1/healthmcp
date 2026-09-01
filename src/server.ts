@@ -7,7 +7,14 @@ import {
   createWaitlistIdentitySecret,
   resolveWaitlistClient,
 } from "./waitlist-client.ts";
-import { createWaitlistStore, submitWaitlist, type WaitlistStore } from "./waitlist.ts";
+import { FirestoreClient } from "./firestore.ts";
+import {
+  FirestoreWaitlistQuota,
+  MemoryWaitlistQuota,
+  type QuotaRule,
+  type WaitlistQuota,
+} from "./waitlist-quota.ts";
+import { createWaitlistStore, normalizeEmail, sha256, submitWaitlist, type WaitlistStore } from "./waitlist.ts";
 
 type ServerDependencies = {
   readonly config?: RuntimeConfig;
@@ -15,11 +22,33 @@ type ServerDependencies = {
   readonly now?: () => Date;
   readonly rateLimiter?: InMemoryRateLimiter;
   readonly waitlistIdentitySecrets?: readonly Uint8Array[];
+  readonly waitlistQuota?: WaitlistQuota;
   readonly waitlistStore?: WaitlistStore;
+  readonly sleep?: (ms: number) => Promise<void>;
 };
 
 export const MAX_REQUEST_BODY_SIZE = 1_048_576;
 const MAX_WAITLIST_BODY_SIZE = 8_192;
+
+// Every answer this endpoint can give about a submitted address is the same
+// answer, so the floor only has to hide the difference in work between
+// "created" and "already there". One create attempt happens either way; the
+// floor covers the storage engine's own variance.
+export const WAITLIST_TIMING_FLOOR_MS = 300;
+
+// The authoritative buckets. `unestablished` is what makes cookie minting
+// pointless: discarding a cookie to get a fresh client id moves the request
+// into a bucket that is shared by everyone doing the same thing.
+// The three original budgets are unchanged; moving them to Firestore is the
+// fix, not relaxing them. `email` is new: it bounds how often one address can
+// be submitted, which is what stops the endpoint being used to send repeated
+// confirmation mail to someone who never asked for it.
+export const WAITLIST_QUOTA_LIMITS = {
+  client: { limit: 5, windowSeconds: 60 },
+  email: { limit: 3, windowSeconds: 3_600 },
+  global: { limit: 60, windowSeconds: 60 },
+  unestablished: { limit: 5, windowSeconds: 60 },
+} as const;
 const UTF8 = new TextEncoder();
 
 const CONTENT_TYPES: Readonly<Record<string, string>> = {
@@ -34,7 +63,26 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
 
 export function createHandler(dependencies: ServerDependencies = {}): (request: Request) => Promise<Response> {
   const config = dependencies.config ?? getRuntimeConfig();
-  const waitlistStore = dependencies.waitlistStore ?? createWaitlistStore(config);
+  const firestoreClient = config.waitlistBackend === "firestore" && config.firestoreProjectId
+    ? new FirestoreClient({
+      databaseId: config.firestoreDatabaseId,
+      projectId: config.firestoreProjectId,
+    })
+    : undefined;
+  const waitlistStore = dependencies.waitlistStore ?? createWaitlistStore(config, firestoreClient);
+  // Firestore decides whether a request is abusive whenever this service is
+  // deployed. The in-process limiter below it is a cheap first pass only; it
+  // was never able to be the limit, because every Cloud Run instance had its
+  // own copy of it.
+  const waitlistQuota = dependencies.waitlistQuota ??
+    (firestoreClient
+      ? new FirestoreWaitlistQuota({
+        client: firestoreClient,
+        collection: `${config.firestoreCollection}_quota`,
+      })
+      : new MemoryWaitlistQuota());
+  const sleep = dependencies.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
@@ -74,9 +122,11 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           request,
           config,
           waitlistStore,
+          waitlistQuota,
           rateLimiter,
           waitlistIdentitySecrets,
           now,
+          sleep,
         );
       }
 
@@ -134,9 +184,11 @@ async function handleWaitlist(
   request: Request,
   config: RuntimeConfig,
   store: WaitlistStore,
+  quota: WaitlistQuota,
   rateLimiter: InMemoryRateLimiter,
   identitySecrets: readonly Uint8Array[],
   now: () => Date,
+  sleep: (ms: number) => Promise<void>,
 ): Promise<Response> {
   if (request.method === "OPTIONS") {
     return withSecurityHeaders(new Response(null, { headers: corsHeaders(request, config), status: 204 }));
@@ -149,16 +201,23 @@ async function handleWaitlist(
   const client = resolveWaitlistClient(request, identitySecrets);
   const respond = (response: Response): Response => withWaitlistClientCookie(response, client.setCookie);
 
-  const rules: RateLimitRule[] = [
-    { key: `waitlist:client:${client.id}`, limit: 5, windowMs: 60_000 },
-    { key: "waitlist:global", limit: 60, windowMs: 60_000 },
+  // Defence in depth, not the limit. This sheds an obvious flood before the
+  // request costs a network round trip, but it is per-instance and so can never
+  // be the thing that decides.
+  const localRules: RateLimitRule[] = [
+    { key: `waitlist:client:${client.id}`, limit: WAITLIST_QUOTA_LIMITS.client.limit, windowMs: 60_000 },
+    { key: "waitlist:global", limit: WAITLIST_QUOTA_LIMITS.global.limit, windowMs: 60_000 },
   ];
   if (!client.authenticated) {
-    rules.unshift({ key: "waitlist:unestablished", limit: 5, windowMs: 60_000 });
+    localRules.unshift({
+      key: "waitlist:unestablished",
+      limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+      windowMs: 60_000,
+    });
   }
-  const decision = rateLimiter.checkMany(rules);
-  if (!decision.allowed) {
-    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+  const local = rateLimiter.checkMany(localRules);
+  if (!local.allowed) {
+    const response = rateLimitedWaitlistResponse(request, config, local.retryAfterSeconds);
     return client.authenticated ? respond(response) : response;
   }
 
@@ -181,6 +240,67 @@ async function handleWaitlist(
     return respond(apiJson({ error: "email is required" }, request, config, { status: 400 }));
   }
 
+  // The authoritative decision, shared by every instance. The per-address
+  // bucket is keyed by the hash, never the address, so the quota collection
+  // holds no readable email even for an operator.
+  const quotaRules: QuotaRule[] = [
+    {
+      key: "waitlist:global",
+      limit: WAITLIST_QUOTA_LIMITS.global.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+    },
+    {
+      key: `waitlist:email:${sha256(normalizeEmail(body.email)).slice(0, 32)}`,
+      limit: WAITLIST_QUOTA_LIMITS.email.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.email.windowSeconds,
+    },
+  ];
+  quotaRules.push(
+    client.authenticated
+      ? {
+        key: `waitlist:client:${client.id.toLowerCase()}`,
+        limit: WAITLIST_QUOTA_LIMITS.client.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+      }
+      : {
+        key: "waitlist:unestablished",
+        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
+      },
+  );
+
+  let decision;
+  try {
+    decision = await quota.consume(quotaRules, now());
+  } catch (error) {
+    // Fail closed. If the shared counter cannot be advanced, this instance has
+    // no idea how much of the budget is already spent, and guessing in the
+    // permissive direction is exactly how a distributed limit becomes no limit.
+    console.error("waitlist quota unavailable", error instanceof Error ? error.name : "unknown error");
+    return respond(
+      apiJson({ error: "waitlist temporarily unavailable" }, request, config, {
+        headers: { "Retry-After": "60" },
+        status: 503,
+      }),
+    );
+  }
+  if (!decision.allowed) {
+    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+    return client.authenticated ? respond(response) : response;
+  }
+
+  // From here to the response, every path costs the same wall time and returns
+  // the same bytes. Nothing downstream may branch on whether the address was
+  // already present.
+  const startedAtMs = now().getTime();
+  const settle = async (response: Response): Promise<Response> => {
+    const elapsed = now().getTime() - startedAtMs;
+    if (elapsed < WAITLIST_TIMING_FLOOR_MS) {
+      await sleep(WAITLIST_TIMING_FLOOR_MS - elapsed);
+    }
+    return respond(response);
+  };
+
   const result = await submitWaitlist(
     store,
     {
@@ -193,10 +313,14 @@ async function handleWaitlist(
   );
 
   if (!result.ok) {
-    return respond(apiJson({ error: result.error }, request, config, { status: result.status }));
+    return await settle(apiJson({ error: result.error }, request, config, { status: result.status }));
   }
 
-  return respond(apiJson({ duplicate: result.duplicate, ok: true }, request, config, { status: 202 }));
+  // `result.outcome` is deliberately not read. Whether this created a pending
+  // entry or found one already there is internal state; publishing it is the
+  // enumeration oracle, whether it is published as a body field, a status code,
+  // a header, or a message on the page.
+  return await settle(apiJson({ ok: true }, request, config, { status: 202 }));
 }
 
 function withWaitlistClientCookie(response: Response, setCookie: string | undefined): Response {
