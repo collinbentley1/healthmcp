@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { FirestoreClient, type FetchLike } from "../src/firestore.ts";
-import { FirestoreWaitlistStore, MemoryWaitlistStore, normalizeEmail, submitWaitlist } from "../src/waitlist.ts";
+import {
+  FileWaitlistStore,
+  FirestoreWaitlistStore,
+  MemoryWaitlistStore,
+  normalizeEmail,
+  submitWaitlist,
+} from "../src/waitlist.ts";
 
 const EMAIL_HASH = new Bun.CryptoHasher("sha256").update("person@example.com").digest("hex");
 
@@ -114,4 +120,68 @@ describe("waitlist", () => {
     expect(requestedUrls.every((url) => !url.match(/documents\/waitlist_preview_12\/[0-9a-f]{64}$/))).toBe(true);
   });
 
+});
+
+describe("waitlist confirmation", () => {
+  const HASH = new Bun.CryptoHasher("sha256").update("confirm@example.com").digest("hex");
+  const AT = Date.parse("2026-09-01T12:00:00.000Z");
+  const seed = async () => {
+    const store = new MemoryWaitlistStore();
+    await submitWaitlist(store, { clientId: "c", email: "confirm@example.com" }, new Date(AT));
+    return store;
+  };
+
+  test("a pending entry is promoted exactly once", async () => {
+    const store = await seed();
+    expect(await store.confirm(HASH, "subject-1", AT + 1_000)).toBe("confirmed");
+    const entry = store.peek(HASH)!;
+    expect(entry.status).toBe("confirmed");
+    expect(entry.confirmedSubject).toBe("subject-1");
+    expect(entry.confirmedAt).toBe("2026-09-01T12:00:01.000Z");
+  });
+
+  test("a replayed confirmation does not promote again or change the record", async () => {
+    const store = await seed();
+    await store.confirm(HASH, "subject-1", AT + 1_000);
+    const afterFirst = { ...store.peek(HASH)! };
+
+    // A second proof for the same address -- a replayed token, or a different
+    // subject presenting one -- must not reset state or rewrite who confirmed.
+    expect(await store.confirm(HASH, "subject-2", AT + 2_000)).toBe("already-confirmed");
+    expect(store.peek(HASH)).toEqual(afterFirst);
+  });
+
+  test("confirmation clears the expiry so a member is not reaped", async () => {
+    const store = await seed();
+    expect(Date.parse(store.peek(HASH)!.expiresAt)).toBeLessThan(AT + 40 * 24 * 60 * 60_000);
+    await store.confirm(HASH, "subject-1", AT + 1_000);
+    // The field stays present for the TTL policy to read, but names an instant
+    // the policy will never reach.
+    expect(Date.parse(store.peek(HASH)!.expiresAt)).toBeGreaterThan(AT + 100 * 365 * 24 * 60 * 60_000);
+  });
+
+  test("an expired pending entry cannot be confirmed", async () => {
+    const store = await seed();
+    const expired = Date.parse(store.peek(HASH)!.expiresAt) + 1_000;
+    expect(await store.confirm(HASH, "subject-1", expired)).toBe("expired");
+    expect(store.peek(HASH)!.status).toBe("pending");
+  });
+
+  test("confirming an address that was never submitted reports absent", async () => {
+    const store = await seed();
+    const other = new Bun.CryptoHasher("sha256").update("nobody@example.com").digest("hex");
+    expect(await store.confirm(other, "subject-1", AT + 1_000)).toBe("absent");
+  });
+
+  test("the file store promotes and replays identically", async () => {
+    const directory = `/tmp/medlock-confirm-${Bun.hash(String(AT))}`;
+    const store = new FileWaitlistStore(directory);
+    await submitWaitlist(store, { clientId: "c", email: "confirm@example.com" }, new Date(AT));
+
+    expect(await store.confirm(HASH, "subject-1", AT + 1_000)).toBe("confirmed");
+    expect(await store.confirm(HASH, "subject-2", AT + 2_000)).toBe("already-confirmed");
+    const entry = (await store.read(HASH))!;
+    expect(entry.status).toBe("confirmed");
+    expect(entry.confirmedSubject).toBe("subject-1");
+  });
 });
