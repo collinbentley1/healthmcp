@@ -147,8 +147,16 @@ export class FirestoreClient {
     return documents;
   }
 
-  // Returns false only for a contention abort, which the caller may retry.
-  // Every other failure is a real failure and throws.
+  // Returns false ONLY for an outcome Firestore states did not happen.
+  //
+  // The distinction matters more than it looks. Returning false makes the
+  // caller begin a fresh, non-idempotent transaction, so `false` is a claim
+  // that nothing was written. ABORTED is exactly that claim: Firestore refused
+  // the commit because the read set moved. A 429 or a 503, by contrast, is
+  // ambiguous -- the server may well have applied the writes and failed to tell
+  // us -- and treating that as "did not commit" is how a quota gets
+  // double-spent or a confirmation reported as unwritten after it landed.
+  // Ambiguity fails closed.
   async commitTransaction(transaction: string, writes: readonly unknown[]): Promise<boolean> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:commit`, {
       body: JSON.stringify({ transaction, writes }),
@@ -156,8 +164,12 @@ export class FirestoreClient {
       method: "POST",
     });
     if (response.ok) return true;
-    if (response.status === 409 || response.status === 429 || response.status === 503) {
-      return false;
+    if (response.status === 409) {
+      // Validate the status rather than inferring it from the code alone: a
+      // 409 that is not an ABORTED is not a statement about the write.
+      const detail = await response.text().catch(() => "");
+      if (detail.includes("ABORTED")) return false;
+      throw new Error("Firestore transactional commit returned an unrecognised conflict");
     }
     throw new Error(`Firestore transactional commit failed: ${response.status}`);
   }

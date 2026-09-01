@@ -64,7 +64,11 @@ function firestoreFleet() {
         };
         if (abortNext > 0) {
           abortNext -= 1;
-          return new Response("", { status: 409 });
+          // What Firestore actually sends for a contention abort.
+          return Response.json(
+            { error: { code: 409, message: "Aborted due to cross-transaction contention", status: "ABORTED" } },
+            { status: 409 },
+          );
         }
         // Serializable isolation: if any document this transaction read has
         // changed since it read it, the commit aborts and the caller must
@@ -75,7 +79,12 @@ function firestoreFleet() {
           : readSets.get(body.transaction);
         if (readSet !== undefined) {
           for (const [name, seen] of readSet) {
-            if (versionOf(name) !== seen) return new Response("", { status: 409 });
+            if (versionOf(name) !== seen) {
+              return Response.json(
+                { error: { code: 409, message: "Aborted due to cross-transaction contention", status: "ABORTED" } },
+                { status: 409 },
+              );
+            }
           }
         }
         commits.push(body.writes);
@@ -292,6 +301,79 @@ describe("waitlist quota", () => {
       name.includes("waitlist__global")
     )!;
     expect(fleet.counters.get(globalKey)).toBe(4);
+  });
+
+  test("a commit that landed but answered 503 is not retried", async () => {
+    // The dangerous case. The server applied the writes and then failed to say
+    // so. Treating that as "did not commit" would begin a fresh, non-idempotent
+    // transaction and spend the budget a second time for one request.
+    const fleet = firestoreFleet();
+    let commits = 0;
+    const quota = quotaOf(fleet, async (input, init) => {
+      const url = String(input);
+      if (url.includes("metadata.google.internal")) {
+        return Response.json({ access_token: "token", expires_in: 3600 });
+      }
+      if (url.endsWith(":beginTransaction")) return Response.json({ transaction: `txn-${commits}` });
+      if (url.endsWith(":batchGet")) {
+        const body = JSON.parse(String(init?.body)) as { documents: string[] };
+        return Response.json(body.documents.map((name) => ({ missing: name })));
+      }
+      if (url.endsWith(":rollback")) return Response.json({});
+      commits += 1;
+      // Applied server-side; the answer is lost.
+      return new Response("", { status: 503 });
+    });
+
+    await expect(quota.consume([RULE], AT)).rejects.toThrow("commit failed: 503");
+    // Exactly one commit was attempted: ambiguity fails closed rather than
+    // spending again.
+    expect(commits).toBe(1);
+  });
+
+  test("a 429 is ambiguous too and is not retried", async () => {
+    const fleet = firestoreFleet();
+    let commits = 0;
+    const quota = quotaOf(fleet, async (input, init) => {
+      const url = String(input);
+      if (url.includes("metadata.google.internal")) {
+        return Response.json({ access_token: "token", expires_in: 3600 });
+      }
+      if (url.endsWith(":beginTransaction")) return Response.json({ transaction: "txn" });
+      if (url.endsWith(":batchGet")) {
+        const body = JSON.parse(String(init?.body)) as { documents: string[] };
+        return Response.json(body.documents.map((name) => ({ missing: name })));
+      }
+      if (url.endsWith(":rollback")) return Response.json({});
+      commits += 1;
+      return new Response("", { status: 429 });
+    });
+
+    await expect(quota.consume([RULE], AT)).rejects.toThrow("commit failed: 429");
+    expect(commits).toBe(1);
+  });
+
+  test("a 409 that is not an ABORTED is refused rather than retried", async () => {
+    const fleet = firestoreFleet();
+    let commits = 0;
+    const quota = quotaOf(fleet, async (input, init) => {
+      const url = String(input);
+      if (url.includes("metadata.google.internal")) {
+        return Response.json({ access_token: "token", expires_in: 3600 });
+      }
+      if (url.endsWith(":beginTransaction")) return Response.json({ transaction: "txn" });
+      if (url.endsWith(":batchGet")) {
+        const body = JSON.parse(String(init?.body)) as { documents: string[] };
+        return Response.json(body.documents.map((name) => ({ missing: name })));
+      }
+      if (url.endsWith(":rollback")) return Response.json({});
+      commits += 1;
+      // A conflict, but not the one that states nothing was written.
+      return Response.json({ error: { status: "ALREADY_EXISTS" } }, { status: 409 });
+    });
+
+    await expect(quota.consume([RULE], AT)).rejects.toThrow("unrecognised conflict");
+    expect(commits).toBe(1);
   });
 
   test("rules must be unique, bounded, and safely keyed", async () => {
