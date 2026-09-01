@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { FirestoreClient } from "../src/firestore.ts";
 import { firestoreErrorIs, parseFirestoreApiError } from "../src/firestore-error.ts";
 
 // Payloads captured verbatim from a running Firestore emulator and from the
@@ -120,5 +121,82 @@ describe("firestore error envelope", () => {
     const parsed = parseFirestoreApiError(409, '{"error":{"code":409,"status":"ABORTED"}}');
     expect(parsed?.status).toBe("ABORTED");
     expect(parsed?.message).toBe("");
+  });
+});
+
+
+// The parser being correct is not the same as the client using it. These drive
+// the real FirestoreClient methods with the decoy bodies, because the decision
+// that matters -- "was this a duplicate", "did this commit" -- is made there.
+describe("the client decides from the decoded status, not the status code", () => {
+  function clientReturning(status: number, body: string) {
+    return new FirestoreClient({
+      databaseId: "(default)",
+      fetcher: async (input) => {
+        if (String(input).includes("metadata.google.internal")) {
+          return Response.json({ access_token: "t", expires_in: 3600 });
+        }
+        return new Response(body, {
+          headers: { "Content-Type": "application/json" },
+          status,
+        });
+      },
+      projectId: "p",
+    });
+  }
+
+  test("create reports a duplicate only for ALREADY_EXISTS", async () => {
+    expect(await clientReturning(409, REAL_ALREADY_EXISTS).create("c", "d", { fields: {} }))
+      .toBe("duplicate");
+  });
+
+  // Contention is not a duplicate. Reporting it as one would tell a caller the
+  // address is already registered when nothing of the sort was established --
+  // an enumeration oracle any attacker can trigger by generating load.
+  test("create refuses to read a contended 409 as a duplicate", async () => {
+    await expect(clientReturning(409, REAL_ABORTED).create("c", "d", { fields: {} }))
+      .rejects.toThrow(/not ALREADY_EXISTS/);
+  });
+
+  test("create refuses a 409 whose body proves nothing", async () => {
+    for (const body of ["", "<html>409 ALREADY_EXISTS</html>", '{"error":{"status":"ALREADY_EXISTS"}}']) {
+      await expect(clientReturning(409, body).create("c", "d", { fields: {} }))
+        .rejects.toThrow(/not ALREADY_EXISTS/);
+    }
+  });
+
+  test("commitTransaction reports not-committed only for ABORTED", async () => {
+    expect(await clientReturning(409, REAL_ABORTED).commitTransaction("t", []))
+      .toEqual({ committed: false });
+  });
+
+  // The dangerous direction: `committed: false` makes the caller re-run a
+  // non-idempotent transaction. A 409 that is not an ABORTED must never
+  // produce it.
+  test("commitTransaction refuses to read ALREADY_EXISTS as a clean abort", async () => {
+    await expect(clientReturning(409, REAL_ALREADY_EXISTS).commitTransaction("t", []))
+      .rejects.toThrow(/unrecognised conflict/);
+  });
+
+  test("commitTransaction is not fooled by the word ABORTED in a message", async () => {
+    const decoy =
+      '{"error":{"code":409,"message":"write ABORTED? no: entity already exists","status":"ALREADY_EXISTS"}}';
+    expect(decoy).toContain("ABORTED");
+    await expect(clientReturning(409, decoy).commitTransaction("t", []))
+      .rejects.toThrow(/unrecognised conflict/);
+  });
+
+  test("commitTransaction is not fooled by a proxy page mentioning ABORTED", async () => {
+    await expect(
+      clientReturning(409, "<html><body>upstream ABORTED</body></html>").commitTransaction("t", []),
+    ).rejects.toThrow(/unrecognised conflict/);
+  });
+
+  // Ambiguity is not a claim that nothing was written.
+  test("commitTransaction never treats an ambiguous status as not-committed", async () => {
+    for (const status of [429, 500, 503, 504]) {
+      await expect(clientReturning(status, "{}").commitTransaction("t", []))
+        .rejects.toThrow(/commit failed/);
+    }
   });
 });
