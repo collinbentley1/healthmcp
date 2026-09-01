@@ -8,6 +8,11 @@ updates:
       time: "09:00"
       timezone: America/New_York
     open-pull-requests-limit: 2
+    ignore:
+      # Same coordinated pin: these entries would bump individual platform
+      # workflow refs on their own, splitting the pin across revisions.
+      # Third-party actions are still tracked normally.
+      - dependency-name: "collinbentley1/platform/*"
 
   - package-ecosystem: bun
     directory: /
@@ -27,14 +32,18 @@ updates:
       timezone: America/New_York
     open-pull-requests-limit: 2
     ignore:
-      # Dependabot runs Terraform 1.15.9. These roots require `~> 1.14.0`,
-      # which is `>= 1.14.0, < 1.15.0`, so its `terraform init` can never
-      # resolve the provider here -- and a newer bundled Terraform moves
-      # further away, not closer. The production constraint is deliberate and
-      # is not changed to suit the bot, so the provider check is disabled
-      # rather than left to fail weekly. The entry itself stays: the module
-      # dependency is tracked successfully and is the immutable platform pin.
+      # Dependabot runs Terraform 1.15.9. These roots require `~> 1.14.0`, i.e.
+      # `>= 1.14.0, < 1.15.0`, so its `terraform init` can never resolve the
+      # provider here, and a newer bundled Terraform moves further away rather
+      # than closer. The production constraint is deliberate and is not changed
+      # to suit the bot, so this check is disabled instead of failing weekly.
       - dependency-name: "hashicorp/google"
+      # The platform pin is one coordinated commit spanning both Terraform
+      # roots, every reusable-workflow `uses`, and the bootstrap WIF trust
+      # arrays. Dependabot can only edit its own directory, so it has already
+      # opened PRs moving one root while leaving the rest behind. Repinning is
+      # done atomically by the platform release process instead.
+      - dependency-name: "bootstrap::platform"
 
   - package-ecosystem: terraform
     directory: /infra/terraform/prod
@@ -45,11 +54,15 @@ updates:
       timezone: America/New_York
     open-pull-requests-limit: 2
     ignore:
-      # Dependabot runs Terraform 1.15.9. These roots require `~> 1.14.0`,
-      # which is `>= 1.14.0, < 1.15.0`, so its `terraform init` can never
-      # resolve the provider here -- and a newer bundled Terraform moves
-      # further away, not closer. The production constraint is deliberate and
-      # is not changed to suit the bot, so the provider check is disabled
-      # rather than left to fail weekly. The entry itself stays: the module
-      # dependency is tracked successfully and is the immutable platform pin.
+      # Dependabot runs Terraform 1.15.9. These roots require `~> 1.14.0`, i.e.
+      # `>= 1.14.0, < 1.15.0`, so its `terraform init` can never resolve the
+      # provider here, and a newer bundled Terraform moves further away rather
+      # than closer. The production constraint is deliberate and is not changed
+      # to suit the bot, so this check is disabled instead of failing weekly.
       - dependency-name: "hashicorp/google"
+      # The platform pin is one coordinated commit spanning both Terraform
+      # roots, every reusable-workflow `uses`, and the bootstrap WIF trust
+      # arrays. Dependabot can only edit its own directory, so it has already
+      # opened PRs moving one root while leaving the rest behind. Repinning is
+      # done atomically by the platform release process instead.
+      - dependency-name: "site::platform"
