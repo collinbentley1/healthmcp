@@ -175,12 +175,49 @@ describe("initialize probe", () => {
     expect(() => getRuntimeConfig({ MEDLOCK_MCP_TOKEN: "too-short" })).toThrow("at least 32 bytes");
   });
 
+  test("an unrecognised waitlist backend is refused, not silently downgraded", () => {
+    // Falling back to the file backend would quietly put a deployment that
+    // meant to say "firestore" onto a backend with no compare-and-swap.
+    expect(() => getRuntimeConfig({ WAITLIST_BACKEND: "firestor" })).toThrow(
+      "WAITLIST_BACKEND must be exactly",
+    );
+    expect(() => getRuntimeConfig({ WAITLIST_BACKEND: "postgres" })).toThrow(
+      "WAITLIST_BACKEND must be exactly",
+    );
+    // Unset still means the local default.
+    expect(getRuntimeConfig({}).waitlistBackend).toBe("file");
+    expect(getRuntimeConfig({ WAITLIST_BACKEND: "" }).waitlistBackend).toBe("file");
+  });
+
+  test("a deployed service must name Firestore explicitly", () => {
+    const active = Buffer.alloc(32, 31).toString("base64url");
+    for (const backend of ["file", "memory"]) {
+      expect(() =>
+        getRuntimeConfig({
+          PLATFORM_DEPLOY_ENVIRONMENT: "production",
+          WAITLIST_BACKEND: backend,
+          WAITLIST_IDENTITY_KEYSET: active,
+        })
+      ).toThrow("must set WAITLIST_BACKEND=firestore");
+    }
+    expect(
+      getRuntimeConfig({
+        PLATFORM_DEPLOY_ENVIRONMENT: "production",
+        WAITLIST_BACKEND: "firestore",
+        WAITLIST_IDENTITY_KEYSET: active,
+      }).waitlistBackend,
+    ).toBe("firestore");
+  });
+
   test("requires stable waitlist identity secrets in deployed services and accepts one prior key", () => {
     const active = Buffer.alloc(32, 21).toString("base64url");
     const prior = Buffer.alloc(32, 22).toString("base64url");
 
     expect(() =>
-      getRuntimeConfig({ PLATFORM_DEPLOY_ENVIRONMENT: "production" }),
+      getRuntimeConfig({
+        PLATFORM_DEPLOY_ENVIRONMENT: "production",
+        WAITLIST_BACKEND: "firestore",
+      }),
     ).toThrow("WAITLIST_IDENTITY_KEYSET is required");
     expect(() =>
       getRuntimeConfig({ WAITLIST_BACKEND: "firestore" }),
@@ -188,12 +225,14 @@ describe("initialize probe", () => {
     expect(() =>
       getRuntimeConfig({
         PLATFORM_DEPLOY_ENVIRONMENT: "preview",
+        WAITLIST_BACKEND: "firestore",
         WAITLIST_IDENTITY_KEYSET: `${active},${active}`,
       }),
     ).toThrow("distinct prior key");
 
     const config = getRuntimeConfig({
       PLATFORM_DEPLOY_ENVIRONMENT: "production",
+      WAITLIST_BACKEND: "firestore",
       WAITLIST_IDENTITY_KEYSET: `${active},${prior}`,
     });
     expect(config.deploymentEnvironment).toBe("production");

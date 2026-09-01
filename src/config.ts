@@ -62,6 +62,15 @@ export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.e
   if ((deploymentEnvironment || waitlistBackend === "firestore") && waitlistIdentitySecrets.length === 0) {
     throw new Error("WAITLIST_IDENTITY_KEYSET is required for deployed services and the Firestore waitlist.");
   }
+  // A deployed service runs many instances against shared state, and only the
+  // Firestore backend offers a durable compare-and-swap. The file backend would
+  // let two concurrent confirmations both succeed, so a deployment must say
+  // Firestore explicitly rather than inherit a local default.
+  if (deploymentEnvironment && waitlistBackend !== "firestore") {
+    throw new Error(
+      "A deployed service must set WAITLIST_BACKEND=firestore; no other backend has a durable compare-and-swap.",
+    );
+  }
 
   return {
     allowedHosts: parseList(env.ALLOWED_HOSTS, DEFAULT_ALLOWED_HOSTS),
@@ -188,9 +197,11 @@ function parseBearerToken(value: string | undefined): string | undefined {
 }
 
 function parseWaitlistBackend(value: string | undefined): RuntimeConfig["waitlistBackend"] {
-  if (value === "firestore" || value === "memory") {
-    return value;
-  }
-
-  return "file";
+  // Unset means the local default. A value that is SET but unrecognised is a
+  // misconfiguration, and silently falling back to the file backend would
+  // quietly downgrade a deployment that meant to say "firestore" -- onto a
+  // backend with no compare-and-swap, where the ownership flow is unsafe.
+  if (value === undefined || value.trim() === "") return "file";
+  if (value === "firestore" || value === "memory" || value === "file") return value;
+  throw new Error("WAITLIST_BACKEND must be exactly firestore, memory, or file.");
 }
