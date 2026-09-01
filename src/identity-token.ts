@@ -22,8 +22,22 @@ const GOOGLE_SECURETOKEN_JWK_URL =
 const MAX_JWK_BYTES = 64 * 1024;
 const MAX_TOKEN_BYTES = 8 * 1024;
 const CLOCK_SKEW_MS = 60_000;
+const MAX_KID_LENGTH = 256;
+const MAX_EMAIL_LENGTH = 254;
 
-type JsonWebKey_ = { readonly kid?: unknown; readonly kty?: unknown; readonly alg?: unknown };
+function asObject(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} is not an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function integralSeconds(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} is not an integral NumericDate`);
+  }
+  return value * 1_000;
+}
 
 function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
   if (!/^[A-Za-z0-9_-]*$/.test(value)) {
@@ -53,7 +67,12 @@ export class IdentityTokenVerifier {
   }
 
   async verify(token: string, nowMs: number): Promise<VerifiedIdentity> {
-    if (token.length === 0 || token.length > MAX_TOKEN_BYTES) {
+    // A non-finite clock makes every comparison below vacuously false, which is
+    // the fail-open shape: an expired token would sail through.
+    if (!Number.isFinite(nowMs)) {
+      throw new Error("identity token verification requires a finite clock");
+    }
+    if (typeof token !== "string" || token.length === 0 || token.length > MAX_TOKEN_BYTES) {
       throw new Error("identity token escaped its size bound");
     }
     const segments = token.split(".");
@@ -61,17 +80,20 @@ export class IdentityTokenVerifier {
       throw new Error("identity token is not a three-segment JWS");
     }
     const [encodedHeader, encodedPayload, encodedSignature] = segments as [string, string, string];
-    const header = JSON.parse(new TextDecoder().decode(base64UrlToBytes(encodedHeader))) as {
-      alg?: unknown;
-      kid?: unknown;
-    };
+    const header = asObject(
+      JSON.parse(new TextDecoder().decode(base64UrlToBytes(encodedHeader))),
+      "identity token header",
+    );
     // The algorithm is pinned. Accepting whatever the token names is how "none"
     // and HMAC-with-the-public-key forgeries get in.
     if (header.alg !== "RS256") {
       throw new Error("identity token algorithm is not RS256");
     }
-    if (typeof header.kid !== "string" || header.kid.length === 0) {
-      throw new Error("identity token names no signing key");
+    if (
+      typeof header.kid !== "string" || header.kid.length === 0 ||
+      header.kid.length > MAX_KID_LENGTH
+    ) {
+      throw new Error("identity token names no usable signing key");
     }
 
     const key = await this.#keyFor(header.kid, nowMs);
@@ -85,16 +107,10 @@ export class IdentityTokenVerifier {
       throw new Error("identity token signature did not verify");
     }
 
-    const payload = JSON.parse(new TextDecoder().decode(base64UrlToBytes(encodedPayload))) as {
-      aud?: unknown;
-      auth_time?: unknown;
-      email?: unknown;
-      email_verified?: unknown;
-      exp?: unknown;
-      iat?: unknown;
-      iss?: unknown;
-      sub?: unknown;
-    };
+    const payload = asObject(
+      JSON.parse(new TextDecoder().decode(base64UrlToBytes(encodedPayload))),
+      "identity token payload",
+    );
     if (payload.aud !== this.#audience) {
       throw new Error("identity token audience is not this project");
     }
@@ -109,12 +125,18 @@ export class IdentityTokenVerifier {
     if (payload.email_verified !== true) {
       throw new Error("identity token does not assert a verified email");
     }
-    if (typeof payload.email !== "string" || payload.email.length === 0) {
-      throw new Error("identity token carries no email");
+    if (
+      typeof payload.email !== "string" || payload.email.length === 0 ||
+      payload.email.length > MAX_EMAIL_LENGTH
+    ) {
+      throw new Error("identity token carries no usable email");
     }
-    const exp = typeof payload.exp === "number" ? payload.exp * 1_000 : Number.NaN;
-    const iat = typeof payload.iat === "number" ? payload.iat * 1_000 : Number.NaN;
-    if (!Number.isFinite(exp) || !Number.isFinite(iat) || iat > exp) {
+    // Integral seconds, as the spec requires. A fractional or non-integral
+    // claim is not a NumericDate, and coercing one invites disagreement between
+    // this check and anything else that reads the token.
+    const exp = integralSeconds(payload.exp, "identity token expiry");
+    const iat = integralSeconds(payload.iat, "identity token issuance");
+    if (iat > exp) {
       throw new Error("identity token timing claims are malformed");
     }
     if (nowMs >= exp + CLOCK_SKEW_MS) {
@@ -135,11 +157,18 @@ export class IdentityTokenVerifier {
     if (this.#keys === undefined || this.#keys.expiresAtMs <= nowMs) {
       this.#keys = await this.#fetchKeys(nowMs);
     }
-    const key = this.#keys.byKid.get(kid);
-    if (key === undefined) {
+    const cached = this.#keys.byKid.get(kid);
+    if (cached !== undefined) return cached;
+    // Google rotates these. Refusing an unknown kid until the cache expires
+    // would turn every rotation into a ten-minute outage, so one forced refresh
+    // is allowed -- exactly one, so an attacker cannot use unknown kids to
+    // drive unbounded fetches.
+    this.#keys = await this.#fetchKeys(nowMs);
+    const refreshed = this.#keys.byKid.get(kid);
+    if (refreshed === undefined) {
       throw new Error("identity token names an unknown signing key");
     }
-    return key;
+    return refreshed;
   }
 
   async #fetchKeys(
@@ -158,12 +187,19 @@ export class IdentityTokenVerifier {
       throw new Error("identity signing key set is malformed");
     }
     const byKid = new Map<string, CryptoKey>();
-    for (const candidate of body.keys as JsonWebKey_[]) {
+    for (const raw of body.keys) {
+      const candidate = asObject(raw, "identity signing key");
       if (
-        typeof candidate.kid !== "string" || candidate.kty !== "RSA" ||
+        typeof candidate.kid !== "string" || candidate.kid.length === 0 ||
+        candidate.kid.length > MAX_KID_LENGTH || candidate.kty !== "RSA" ||
         (candidate.alg !== undefined && candidate.alg !== "RS256")
       ) {
         throw new Error("identity signing key set contains an unusable key");
+      }
+      // Two entries claiming one kid make "which key signed this" ambiguous,
+      // and last-one-wins would let a planted entry shadow the real key.
+      if (byKid.has(candidate.kid)) {
+        throw new Error("identity signing key set repeats a key id");
       }
       byKid.set(
         candidate.kid,

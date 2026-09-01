@@ -182,6 +182,89 @@ describe("identity token verification", () => {
     expect(fetches).toBe(2);
   });
 
+  test("a non-finite clock is refused rather than passing every comparison", async () => {
+    // NaN makes every timing comparison false, which is the fail-open shape: an
+    // expired token would sail straight through.
+    const token = await signToken({ payload: { exp: Math.floor(NOW / 1_000) - 10_000 } });
+    await expect(verifier().verify(token, Number.NaN)).rejects.toThrow("finite clock");
+    await expect(verifier().verify(token, Number.POSITIVE_INFINITY)).rejects.toThrow("finite clock");
+  });
+
+  test.each([
+    ["fractional", 1_800_000_000.5],
+    ["a string", "1800000000"],
+    ["negative", -1],
+    ["zero", 0],
+  ])("an expiry that is %s is refused", async (_label, exp) => {
+    await expect(verifier().verify(await signToken({ payload: { exp } }), NOW))
+      .rejects.toThrow("integral NumericDate");
+  });
+
+  test("an issuance that is not an integral NumericDate is refused", async () => {
+    await expect(verifier().verify(await signToken({ payload: { iat: 1.5 } }), NOW))
+      .rejects.toThrow("integral NumericDate");
+  });
+
+  test.each([
+    ["an array header", [1, 2, 3]],
+    ["a string header", "header"],
+    ["a null header", null],
+  ])("%s is refused", async (_label, header) => {
+    const encoded = b64url(new TextEncoder().encode(JSON.stringify(header)));
+    const rest = (await signToken({})).split(".").slice(1).join(".");
+    await expect(verifier().verify(`${encoded}.${rest}`, NOW)).rejects.toThrow();
+  });
+
+  test("an oversized kid is refused", async () => {
+    await expect(verifier().verify(await signToken({ header: { kid: "k".repeat(300) } }), NOW))
+      .rejects.toThrow("no usable signing key");
+  });
+
+  test("an oversized email is refused", async () => {
+    await expect(
+      verifier().verify(
+        await signToken({ payload: { email: `${"a".repeat(250)}@example.com` } }),
+        NOW,
+      ),
+    ).rejects.toThrow("no usable email");
+  });
+
+  test("a key set that repeats a key id is refused whole", async () => {
+    // Last-one-wins would let a planted entry shadow the real key.
+    await expect(
+      verifier(async () => Response.json({ keys: [publicJwk, { ...publicJwk }] }))
+        .verify(await signToken({}), NOW),
+    ).rejects.toThrow("repeats a key id");
+  });
+
+  test("key rotation refreshes once instead of failing for the cache lifetime", async () => {
+    // A rotated kid must not be a ten-minute outage.
+    let served = 0;
+    const rotating = verifier(async () => {
+      served += 1;
+      return served === 1
+        ? Response.json({ keys: [{ ...publicJwk, kid: "kid-old" }] })
+        : Response.json({ keys: [publicJwk] });
+    });
+
+    await expect(rotating.verify(await signToken({}), NOW)).resolves.toBeDefined();
+    expect(served).toBe(2);
+  });
+
+  test("an unknown key id costs exactly one forced refresh, not unbounded fetches", async () => {
+    let served = 0;
+    const counting = verifier(async () => {
+      served += 1;
+      return Response.json({ keys: [publicJwk] });
+    });
+
+    await expect(counting.verify(await signToken({ header: { kid: "kid-nope" } }), NOW))
+      .rejects.toThrow("unknown signing key");
+    // One initial fetch plus one forced refresh, and no more: otherwise unknown
+    // kids would be a way to drive traffic at Google on demand.
+    expect(served).toBe(2);
+  });
+
   test("the audience must be a project id, not an arbitrary string", () => {
     expect(() => new IdentityTokenVerifier({ audience: "" })).toThrow("project id");
     expect(() => new IdentityTokenVerifier({ audience: "Not A Project" })).toThrow("project id");
