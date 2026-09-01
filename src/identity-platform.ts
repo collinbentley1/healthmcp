@@ -1,4 +1,12 @@
+import { readBoundedResponseJson } from "./bounded-response.ts";
+
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+const MAX_ACCESS_TOKEN_LENGTH = 8_192;
+const MAX_METADATA_BODY_BYTES = 4_096;
+const MAX_RESPONSE_BODY_BYTES = 8_192;
+const MAX_OOB_CODE_LENGTH = 512;
+const MAX_LINK_STATE_LENGTH = 4_096;
 
 // Sends the ownership challenge, server-side.
 //
@@ -14,7 +22,8 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 // This uses the Admin surface with the runtime service account instead. The
 // endpoint is unauthenticated to nobody: only this server holds the identity
 // that can call it, so a challenge can only be sent after the request has
-// already passed the waitlist's own quota and membership checks.
+// already passed the waitlist's shared quota and bot assessment. Dispatch is
+// deliberately independent of existing membership.
 export class IdentityPlatformClient {
   readonly #continueUrl: string;
   readonly #fetch: FetchLike;
@@ -28,7 +37,24 @@ export class IdentityPlatformClient {
     projectId: string;
     timeoutMs?: number;
   }) {
-    this.#continueUrl = options.continueUrl;
+    const continueUrl = new URL(options.continueUrl);
+    if (
+      continueUrl.protocol !== "https:" ||
+      continueUrl.username !== "" ||
+      continueUrl.password !== "" ||
+      continueUrl.search !== "" ||
+      continueUrl.hash !== "" ||
+      continueUrl.pathname !== "/api/waitlist/confirm"
+    ) {
+      throw new Error("Identity Platform continue URL must be a clean HTTPS confirmation endpoint");
+    }
+    if (!/^[a-z][a-z0-9-]{4,61}[a-z0-9]$/.test(options.projectId)) {
+      throw new Error("Identity Platform project id is invalid");
+    }
+    if (!Number.isSafeInteger(options.timeoutMs ?? 5_000) || (options.timeoutMs ?? 5_000) < 1) {
+      throw new Error("Identity Platform timeout must be a positive integer");
+    }
+    this.#continueUrl = continueUrl.toString();
     this.#fetch = options.fetcher ?? fetch;
     this.#projectId = options.projectId;
     this.#timeoutMs = options.timeoutMs ?? 5_000;
@@ -39,7 +65,11 @@ export class IdentityPlatformClient {
   // Throws on any failure. The caller is expected to swallow that: whether a
   // send succeeded is information about whether the address is on the list,
   // and must not reach the response.
-  async sendSignInLink(email: string, emailHash: string, nowMs: number): Promise<void> {
+  async sendSignInLink(email: string, linkState: string, nowMs: number): Promise<void> {
+    assertEmail(email);
+    assertOpaque(linkState, MAX_LINK_STATE_LENGTH, "link state");
+    assertNow(nowMs);
+    const deadline = AbortSignal.timeout(this.#timeoutMs);
     const response = await this.#fetch(
       `https://identitytoolkit.googleapis.com/v1/projects/${
         encodeURIComponent(this.#projectId)
@@ -47,16 +77,16 @@ export class IdentityPlatformClient {
       {
         body: JSON.stringify({
           canHandleCodeInApp: true,
-          continueUrl: this.#continueUrlFor(emailHash),
+          continueUrl: this.#continueUrlFor(linkState),
           email,
           requestType: "EMAIL_SIGNIN",
         }),
         headers: {
-          Authorization: `Bearer ${await this.#accessToken(nowMs)}`,
+          Authorization: `Bearer ${await this.#accessToken(nowMs, deadline)}`,
           "Content-Type": "application/json; charset=utf-8",
         },
         method: "POST",
-        signal: AbortSignal.timeout(this.#timeoutMs),
+        signal: deadline,
       },
     );
     if (!response.ok) {
@@ -66,105 +96,137 @@ export class IdentityPlatformClient {
     }
   }
 
-  // Turns the oobCode from a mailed link into an ID token, keylessly.
+  // Proves that an OOB code was issued for an EMAIL_SIGNIN request and returns
+  // the address Google bound to it.
   //
-  // The usual way to do this is `accounts:signInWithEmailLink` with a public
-  // Firebase API key from the browser. That is the same surface rejected for
-  // dispatch, for the same reason: a key that reaches a browser can be lifted
-  // out of it and replayed against sendOobCode for arbitrary addresses. It is
-  // also unnecessary. The Identity Toolkit discovery document declares this
-  // method's auth as OAuth2 `cloud-platform`:
+  // `accounts:signInWithEmailLink` is intentionally NOT used. Google's primary
+  // REST contract requires an API key for that method even when OAuth scopes
+  // are also listed. A key would add a long-lived credential that can reach
+  // other Identity Toolkit methods if it is ever disclosed.
   //
-  //   accounts.signInWithEmailLink
-  //     path   : v1/accounts:signInWithEmailLink
-  //     scopes : ['https://www.googleapis.com/auth/cloud-platform']
-  //
-  // so a short-lived service-account bearer token is sufficient and no
-  // long-lived key needs to exist anywhere.
-  async exchangeSignInLink(
-    email: string,
-    oobCode: string,
-    nowMs: number,
-  ): Promise<string> {
+  // `accounts:resetPassword`, despite its historical name, documents a
+  // check-only operation: supplying only an OOB code returns the code's type
+  // and email without consuming it. It accepts a short-lived OAuth bearer and
+  // only PASSWORD_RESET codes can be consumed through that method. The
+  // application therefore verifies EMAIL_SIGNIN possession here and performs
+  // its own single-use, compare-and-swap promotion in Firestore.
+  async verifyEmailLink(oobCode: string, nowMs: number): Promise<string> {
+    assertOpaque(oobCode, MAX_OOB_CODE_LENGTH, "OOB code");
+    assertNow(nowMs);
+    const deadline = AbortSignal.timeout(this.#timeoutMs);
     const response = await this.#fetch(
-      "https://identitytoolkit.googleapis.com/v1/accounts:signInWithEmailLink",
+      "https://identitytoolkit.googleapis.com/v1/accounts:resetPassword",
       {
-        body: JSON.stringify({ email, oobCode }),
+        body: JSON.stringify({ oobCode }),
         headers: {
-          Authorization: `Bearer ${await this.#accessToken(nowMs)}`,
+          Authorization: `Bearer ${await this.#accessToken(nowMs, deadline)}`,
           "Content-Type": "application/json; charset=utf-8",
-          // The method takes no targetProjectId, so the project is resolved
-          // from the caller. Stated explicitly rather than left to whatever
-          // the credential happens to default to.
+          // The OOB code is itself project-bound. This header makes the quota
+          // and billing project explicit without pretending it can replace an
+          // API key on methods whose contract requires one.
           "X-Goog-User-Project": this.#projectId,
         },
         method: "POST",
-        signal: AbortSignal.timeout(this.#timeoutMs),
+        signal: deadline,
       },
     );
     if (!response.ok) {
-      // Status only. An oobCode is a live single-use credential and the address
-      // is the thing that must never be logged, so neither goes anywhere near
-      // this message.
-      throw new Error(`Identity Platform signInWithEmailLink failed: ${response.status}`);
+      // Status only. The OOB code is a live credential and the address must
+      // never reach a log line.
+      throw new Error(`Identity Platform OOB verification failed: ${response.status}`);
     }
-    const body: unknown = await response.json().catch(() => undefined);
+    const body = await readBoundedResponseJson(
+      response,
+      MAX_RESPONSE_BODY_BYTES,
+      "Identity Platform OOB verification",
+    );
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      throw new Error("Identity Platform signInWithEmailLink returned an unreadable body");
+      throw new Error("Identity Platform OOB verification returned an unreadable body");
     }
     const result = body as {
       email?: unknown;
-      idToken?: unknown;
-      mfaPendingCredential?: unknown;
+      requestType?: unknown;
     };
-    // A second factor was required, so no ID token was issued. This is not a
-    // partial success to be worked around: nothing has been proved yet.
-    if (result.mfaPendingCredential !== undefined) {
-      throw new Error("Identity Platform signInWithEmailLink requires a second factor");
+    if (result.requestType !== "EMAIL_SIGNIN") {
+      throw new Error("Identity Platform OOB verification returned the wrong request type");
     }
-    if (typeof result.idToken !== "string" || result.idToken.length === 0) {
-      throw new Error("Identity Platform signInWithEmailLink returned no ID token");
+    if (typeof result.email !== "string") {
+      throw new Error("Identity Platform OOB verification returned no address");
     }
-    // The response echoes the address it signed in. It must be the one asked
-    // for; the token is verified again by the caller regardless.
-    if (typeof result.email !== "string" || result.email.trim().toLowerCase() !== email) {
-      throw new Error("Identity Platform signInWithEmailLink returned a different address");
+    const email = result.email.trim().toLowerCase();
+    if (!isNormalizedEmail(email)) {
+      throw new Error("Identity Platform OOB verification returned an invalid address");
     }
-    return result.idToken;
+    return email;
   }
 
-  // The return link carries the entry's hash so the exchange can recover which
-  // address to present alongside the oobCode.
-  //
-  // Putting the hash here is safe because it is not the secret: the oobCode is,
-  // and it only ever exists inside the message delivered to that mailbox. An
-  // attacker can compute the hash of any address they already know and learn
-  // nothing, because without a live oobCode the exchange refuses.
-  #continueUrlFor(emailHash: string): string {
+  // The return link carries authenticated, encrypted state. It contains the
+  // address needed to bind the OOB-code response, but neither the address nor a
+  // guessable email hash is exposed in the URL.
+  #continueUrlFor(linkState: string): string {
     const url = new URL(this.#continueUrl);
-    url.searchParams.set("h", emailHash);
+    url.searchParams.set("state", linkState);
     return url.toString();
   }
 
-  async #accessToken(nowMs: number): Promise<string> {
+  async #accessToken(nowMs: number, signal: AbortSignal): Promise<string> {
     if (this.#token && this.#token.expiresAt > nowMs + 60_000) {
       return this.#token.accessToken;
     }
     const response = await this.#fetch(
       "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-      { headers: { "Metadata-Flavor": "Google" }, signal: AbortSignal.timeout(this.#timeoutMs) },
+      { headers: { "Metadata-Flavor": "Google" }, signal },
     );
     if (!response.ok) {
       throw new Error(`metadata token request failed: ${response.status}`);
     }
-    const token = (await response.json()) as { access_token: string; expires_in: number };
-    if (typeof token.access_token !== "string" || token.access_token.length === 0) {
-      throw new Error("metadata token response carried no access token");
+    const token = await readBoundedResponseJson(
+      response,
+      MAX_METADATA_BODY_BYTES,
+      "metadata token response",
+    ) as { access_token?: unknown; expires_in?: unknown };
+    if (
+      typeof token.access_token !== "string" ||
+      token.access_token.length === 0 ||
+      token.access_token.length > MAX_ACCESS_TOKEN_LENGTH ||
+      typeof token.expires_in !== "number" ||
+      !Number.isSafeInteger(token.expires_in) ||
+      token.expires_in <= 0 ||
+      token.expires_in > 86_400
+    ) {
+      throw new Error("metadata token response is invalid");
     }
     this.#token = {
       accessToken: token.access_token,
       expiresAt: nowMs + Number(token.expires_in) * 1000,
     };
     return token.access_token;
+  }
+}
+
+function assertNow(nowMs: number): void {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+    throw new Error("Identity Platform request time is invalid");
+  }
+}
+
+function assertEmail(email: string): void {
+  if (!isNormalizedEmail(email)) {
+    throw new Error("Identity Platform address must be normalized");
+  }
+}
+
+function isNormalizedEmail(email: string): boolean {
+  return (
+    email.length >= 3 &&
+    email.length <= 254 &&
+    email === email.trim().toLowerCase() &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+
+function assertOpaque(value: string, maxLength: number, label: string): void {
+  if (value.length < 1 || value.length > maxLength || !/^[A-Za-z0-9._~-]+$/.test(value)) {
+    throw new Error(`Identity Platform ${label} is invalid`);
   }
 }

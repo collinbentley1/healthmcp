@@ -1,3 +1,5 @@
+import { executeWaitlistRecaptcha } from "./recaptcha-browser.ts";
+
 const form = document.querySelector<HTMLFormElement>("[data-waitlist-form]");
 const emailInput = document.querySelector<HTMLInputElement>("[data-waitlist-email]");
 const statusText = document.querySelector<HTMLElement>("[data-waitlist-status]");
@@ -18,8 +20,10 @@ form?.addEventListener("submit", async (event) => {
   setStatus("Joining...", "pending");
 
   try {
+    const recaptchaToken = await executeWaitlistRecaptcha("join");
     const response = await fetch("/api/waitlist", {
-      body: JSON.stringify({ email, source: "site" }),
+      body: JSON.stringify({ email, recaptchaToken, source: "site" }),
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       method: "POST",
     });

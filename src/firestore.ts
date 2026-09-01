@@ -1,4 +1,8 @@
 import { firestoreErrorIs } from "./firestore-error.ts";
+import {
+  readBoundedResponseJson,
+  readBoundedResponseText,
+} from "./bounded-response.ts";
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -35,6 +39,11 @@ export type FirestoreDocument = {
 // re-read rather than retry the same write.
 export type FirestoreConditionalOutcome = "committed" | "precondition-failed";
 
+const MAX_ACCESS_TOKEN_LENGTH = 8_192;
+const MAX_ERROR_BODY_BYTES = 16_384;
+const MAX_FIRESTORE_BODY_BYTES = 262_144;
+const MAX_METADATA_BODY_BYTES = 4_096;
+
 // One Firestore client for every collection this service touches, so the
 // metadata-server token is fetched and cached once rather than per store.
 export class FirestoreClient {
@@ -61,14 +70,18 @@ export class FirestoreClient {
     return `${this.documentsBasePath}/${encodePathSegment(collection)}/${encodePathSegment(documentId)}`;
   }
 
-  async headers(): Promise<Record<string, string>> {
-    return { Authorization: `Bearer ${await this.#accessToken()}` };
+  async headers(signal?: AbortSignal): Promise<Record<string, string>> {
+    return { Authorization: `Bearer ${await this.#accessToken(signal)}` };
   }
 
-  async get(collection: string, documentId: string): Promise<FirestoreDocument | undefined> {
+  async get(
+    collection: string,
+    documentId: string,
+    signal?: AbortSignal,
+  ): Promise<FirestoreDocument | undefined> {
     const response = await this.#fetch(
       `${this.documentsBaseUrl}/${encodePathSegment(collection)}/${encodePathSegment(documentId)}`,
-      { headers: await this.headers() },
+      { headers: await this.headers(signal), signal: signal ?? null },
     );
     if (response.status === 404) {
       return undefined;
@@ -76,7 +89,15 @@ export class FirestoreClient {
     if (!response.ok) {
       throw new Error(`Firestore read failed: ${response.status}`);
     }
-    return (await response.json()) as FirestoreDocument;
+    const body = await readBoundedResponseJson(
+      response,
+      MAX_FIRESTORE_BODY_BYTES,
+      "Firestore read",
+    );
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      throw new Error("Firestore read returned an unreadable document");
+    }
+    return body as FirestoreDocument;
   }
 
   // Create-if-absent, decided by Firestore rather than by a read followed by a
@@ -87,13 +108,15 @@ export class FirestoreClient {
     collection: string,
     documentId: string,
     document: FirestoreDocument,
+    signal?: AbortSignal,
   ): Promise<FirestoreCreateOutcome> {
     const response = await this.#fetch(
       `${this.documentsBaseUrl}/${encodePathSegment(collection)}?documentId=${encodeURIComponent(documentId)}`,
       {
         body: JSON.stringify(document),
-        headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+        headers: { ...(await this.headers(signal)), "Content-Type": "application/json; charset=utf-8" },
         method: "POST",
+        signal: signal ?? null,
       },
     );
     if (response.status === 409) {
@@ -102,7 +125,11 @@ export class FirestoreClient {
       // exactly the answer that tells a caller the address is already on the
       // list, so inferring it from contention hands back an enumeration
       // oracle that an attacker can trigger on demand by generating load.
-      const detail = await response.text().catch(() => "");
+      const detail = await readBoundedResponseText(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        "Firestore create conflict",
+      ).catch(() => "");
       if (firestoreErrorIs(409, detail, "ALREADY_EXISTS")) {
         return "duplicate";
       }
@@ -123,17 +150,26 @@ export class FirestoreClient {
   // transaction lets the counters be READ, judged, and only then advanced --
   // and Firestore aborts the commit if anything the read touched changed
   // underneath it, so two racing instances cannot both pass the same check.
-  async beginTransaction(): Promise<string> {
+  async beginTransaction(signal?: AbortSignal): Promise<string> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:beginTransaction`, {
       body: JSON.stringify({ options: { readWrite: {} } }),
-      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      headers: { ...(await this.headers(signal)), "Content-Type": "application/json; charset=utf-8" },
       method: "POST",
+      signal: signal ?? null,
     });
     if (!response.ok) {
       throw new Error(`Firestore beginTransaction failed: ${response.status}`);
     }
-    const body = (await response.json()) as { transaction?: unknown };
-    if (typeof body.transaction !== "string" || body.transaction.length === 0) {
+    const body = await readBoundedResponseJson(
+      response,
+      MAX_FIRESTORE_BODY_BYTES,
+      "Firestore beginTransaction",
+    ) as { transaction?: unknown };
+    if (
+      typeof body.transaction !== "string" ||
+      body.transaction.length === 0 ||
+      body.transaction.length > 4_096
+    ) {
       throw new Error("Firestore beginTransaction returned no transaction token");
     }
     return body.transaction;
@@ -144,16 +180,22 @@ export class FirestoreClient {
   async batchGet(
     names: readonly string[],
     transaction: string,
+    signal?: AbortSignal,
   ): Promise<ReadonlyMap<string, FirestoreDocument | undefined>> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:batchGet`, {
       body: JSON.stringify({ documents: names, transaction }),
-      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      headers: { ...(await this.headers(signal)), "Content-Type": "application/json; charset=utf-8" },
       method: "POST",
+      signal: signal ?? null,
     });
     if (!response.ok) {
       throw new Error(`Firestore batchGet failed: ${response.status}`);
     }
-    const results = (await response.json()) as readonly {
+    const results = await readBoundedResponseJson(
+      response,
+      MAX_FIRESTORE_BODY_BYTES,
+      "Firestore batchGet",
+    ) as readonly {
       readonly found?: {
         readonly fields?: Record<string, FirestoreValue>;
         readonly name: string;
@@ -200,11 +242,13 @@ export class FirestoreClient {
   async commitTransaction(
     transaction: string,
     writes: readonly unknown[],
+    signal?: AbortSignal,
   ): Promise<FirestoreCommitOutcome> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:commit`, {
       body: JSON.stringify({ transaction, writes }),
-      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      headers: { ...(await this.headers(signal)), "Content-Type": "application/json; charset=utf-8" },
       method: "POST",
+      signal: signal ?? null,
     });
     if (response.ok) {
       return { committed: true, transformResults: await readTransformResults(response) };
@@ -215,18 +259,23 @@ export class FirestoreClient {
       // proxy's HTML error page -- none of which are statements about the
       // write. Observed shape, verbatim from the emulator:
       //   {"error":{"code":409,"message":"Transaction lock timeout.","status":"ABORTED"}}
-      const detail = await response.text().catch(() => "");
+      const detail = await readBoundedResponseText(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        "Firestore transactional commit conflict",
+      ).catch(() => "");
       if (firestoreErrorIs(409, detail, "ABORTED")) return { committed: false };
       throw new Error("Firestore transactional commit returned an unrecognised conflict");
     }
     throw new Error(`Firestore transactional commit failed: ${response.status}`);
   }
 
-  async rollback(transaction: string): Promise<void> {
+  async rollback(transaction: string, signal?: AbortSignal): Promise<void> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:rollback`, {
       body: JSON.stringify({ transaction }),
-      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      headers: { ...(await this.headers(signal)), "Content-Type": "application/json; charset=utf-8" },
       method: "POST",
+      signal: signal ?? null,
     });
     // A rollback that fails changes nothing: the transaction expires on its
     // own and no write was ever committed under it.
@@ -240,17 +289,25 @@ export class FirestoreClient {
   // transaction isolation. That matters because isolation is a cross-document
   // guarantee this service cannot verify from outside, whereas the
   // precondition is observable: a stale base version is refused outright.
-  async commitConditional(writes: readonly unknown[]): Promise<FirestoreConditionalOutcome> {
+  async commitConditional(
+    writes: readonly unknown[],
+    signal?: AbortSignal,
+  ): Promise<FirestoreConditionalOutcome> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:commit`, {
       body: JSON.stringify({ writes }),
-      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      headers: { ...(await this.headers(signal)), "Content-Type": "application/json; charset=utf-8" },
       method: "POST",
+      signal: signal ?? null,
     });
     if (response.ok) {
       return "committed";
     }
     if (response.status === 400) {
-      const detail = await response.text().catch(() => "");
+      const detail = await readBoundedResponseText(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        "Firestore conditional commit rejection",
+      ).catch(() => "");
       if (firestoreErrorIs(400, detail, "FAILED_PRECONDITION")) {
         return "precondition-failed";
       }
@@ -259,24 +316,32 @@ export class FirestoreClient {
     throw new Error(`Firestore conditional commit failed: ${response.status}`);
   }
 
-  async commit(writes: readonly unknown[]): Promise<{
+  async commit(writes: readonly unknown[], signal?: AbortSignal): Promise<{
     readonly writeResults: readonly { transformResults?: readonly FirestoreValue[] }[];
   }> {
     const response = await this.#fetch(`${this.documentsBaseUrl}:commit`, {
       body: JSON.stringify({ writes }),
-      headers: { ...(await this.headers()), "Content-Type": "application/json; charset=utf-8" },
+      headers: { ...(await this.headers(signal)), "Content-Type": "application/json; charset=utf-8" },
       method: "POST",
+      signal: signal ?? null,
     });
     if (!response.ok) {
       throw new Error(`Firestore commit failed: ${response.status}`);
     }
-    const body = (await response.json()) as {
+    const body = await readBoundedResponseJson(
+      response,
+      MAX_FIRESTORE_BODY_BYTES,
+      "Firestore commit",
+    ) as {
       writeResults?: readonly { transformResults?: readonly FirestoreValue[] }[];
     };
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      throw new Error("Firestore commit returned an unreadable body");
+    }
     return { writeResults: body.writeResults ?? [] };
   }
 
-  async #accessToken(): Promise<string> {
+  async #accessToken(signal?: AbortSignal): Promise<string> {
     const now = Date.now();
     if (this.#token && this.#token.expiresAt > now + 60_000) {
       return this.#token.accessToken;
@@ -284,13 +349,28 @@ export class FirestoreClient {
 
     const response = await this.#fetch(
       "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-      { headers: { "Metadata-Flavor": "Google" } },
+      { headers: { "Metadata-Flavor": "Google" }, signal: signal ?? null },
     );
     if (!response.ok) {
       throw new Error(`metadata token request failed: ${response.status}`);
     }
 
-    const token = (await response.json()) as { access_token: string; expires_in: number };
+    const token = await readBoundedResponseJson(
+      response,
+      MAX_METADATA_BODY_BYTES,
+      "metadata token response",
+    ) as { access_token?: unknown; expires_in?: unknown };
+    if (
+      typeof token.access_token !== "string" ||
+      token.access_token.length === 0 ||
+      token.access_token.length > MAX_ACCESS_TOKEN_LENGTH ||
+      typeof token.expires_in !== "number" ||
+      !Number.isSafeInteger(token.expires_in) ||
+      token.expires_in <= 0 ||
+      token.expires_in > 86_400
+    ) {
+      throw new Error("metadata token response is invalid");
+    }
     this.#token = { accessToken: token.access_token, expiresAt: now + token.expires_in * 1000 };
     return token.access_token;
   }
@@ -303,12 +383,11 @@ async function readTransformResults(
   // checked. That is not treated as success-with-unknown-effect; the caller
   // needs the transform values to enforce its bound, so an unreadable body is
   // surfaced as an error rather than silently returning an empty list.
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    throw new Error("Firestore commit returned an unreadable body");
-  }
+  const body = await readBoundedResponseJson(
+    response,
+    MAX_FIRESTORE_BODY_BYTES,
+    "Firestore commit",
+  );
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new Error("Firestore commit returned an unreadable body");
   }

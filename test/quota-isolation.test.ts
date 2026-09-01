@@ -171,6 +171,35 @@ describe("quota fails closed on an uncheckable commit", () => {
 // bound, contention would decide how long a request takes -- which is both a
 // latency amplifier and a signal about somebody else's traffic.
 describe("quota bounds its own retry latency", () => {
+  test("aborts a first Firestore call that never answers", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const client = new FirestoreClient({
+      databaseId: "(default)",
+      fetcher: (_input, init) => {
+        observedSignal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => {
+          observedSignal?.addEventListener("abort", () => reject(observedSignal?.reason), {
+            once: true,
+          });
+        });
+      },
+      projectId: "medlock-1025243085",
+    });
+    const quota = new FirestoreWaitlistQuota({
+      client,
+      collection: "q",
+      deadlineMs: 20,
+    });
+
+    const startedAt = performance.now();
+    await expect(
+      quota.consume([{ key: "global", limit: 5, windowSeconds: 60 }], new Date("2026-09-01T12:00:00.000Z")),
+    ).rejects.toThrow(/deadline/);
+
+    expect(observedSignal?.aborted).toBe(true);
+    expect(performance.now() - startedAt).toBeLessThan(500);
+  });
+
   test("stops retrying once the decision deadline passes", async () => {
     let commits = 0;
     const client = new FirestoreClient({

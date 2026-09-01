@@ -94,19 +94,16 @@ await requireContains(
   "A live TTL verification gate must remain wired into the project's scripts.",
 );
 
-// The ownership flow, and the two ways it could quietly become dangerous.
-//
-// An API key would make the Identity Platform send endpoint callable by anyone
-// who reads the page, turning the project into a mail relay aimed at strangers.
-// Dispatching without a membership check would do the same thing from the
-// server side.
-// What separates the safe surface from the dangerous one is the CREDENTIAL, not
-// the URL shape. `accounts:signInWithEmailLink` is unscoped but declares OAuth2
-// cloud-platform in the Identity Toolkit discovery document, so it is reached
-// with a short-lived service-account bearer. What must never appear is an API
-// key: a key that reaches a browser can be lifted out and replayed against
-// sendOobCode for arbitrary addresses.
-for (const path of ["src/identity-platform.ts", "src/server.ts", "infra/terraform/prod/main.tf"]) {
+// Ownership confirmation stays server-side and keyless. A browser-visible API
+// key would turn the Google mail surface into an attacker-controlled relay.
+for (
+  const path of [
+    "src/config.ts",
+    "src/identity-platform.ts",
+    "src/server.ts",
+    "infra/terraform/prod/main.tf",
+  ]
+) {
   for (const forbidden of ["key=", "apiKey", "api_key", "browser_key", "google_apikeys_key"]) {
     await rejectContains(
       path,
@@ -115,79 +112,187 @@ for (const path of ["src/identity-platform.ts", "src/server.ts", "infra/terrafor
     );
   }
 }
-// Dispatch names the project explicitly; only the admin surface accepts that.
 await requireContains(
   "src/identity-platform.ts",
   "/accounts:sendOobCode",
-  "Challenge dispatch must use the project-scoped admin sendOobCode endpoint.",
+  "Confirmation dispatch must use the project-scoped admin sendOobCode endpoint.",
 );
 await requireContains(
   "src/identity-platform.ts",
   "v1/projects/${",
-  "Challenge dispatch must address the project-scoped endpoint, not the unscoped one.",
+  "Confirmation dispatch must address the project-scoped endpoint.",
 );
-// And every call to Identity Platform authenticates with a bearer token.
 await requireContains(
   "src/identity-platform.ts",
-  "Authorization: `Bearer ${await this.#accessToken(nowMs)}`",
-  "Identity Platform calls must authenticate with a short-lived service-account bearer token.",
+  "/v1/accounts:resetPassword",
+  "OOB ownership verification must use the documented OAuth check-only endpoint.",
 );
 await requireContains(
-  "src/server.ts",
-  "if (await store.pendingExists(emailHash, nowMs)) {",
-  "A sign-in link may only be dispatched to an address with a live pending entry.",
+  "src/identity-platform.ts",
+  'result.requestType !== "EMAIL_SIGNIN"',
+  "Only EMAIL_SIGNIN OOB codes may reach waitlist promotion.",
 );
-// The exchange promotes nobody unless the token it verified names the same
-// address the link was issued for.
+await rejectContains(
+  "src/identity-platform.ts",
+  "signInWithEmailLink(",
+  "The API-key-required signInWithEmailLink method must remain absent.",
+);
 await requireContains(
-  "src/server.ts",
-  "if (sha256(identity.email) !== emailHash) return await refuse();",
-  "The exchange must bind the verified identity to the entry the link was issued for.",
+  "src/identity-platform.ts",
+  '"X-Goog-User-Project": this.#projectId',
+  "OOB verification must bind OAuth quota and billing to the configured project.",
 );
-// Promotion stays unreachable until the live exchange has been proved.
 await requireContains(
-  "src/server.ts",
-  "!config.waitlistActivationEnabled",
-  "Activation must remain gated until the mailed oobCode exchange is proved end to end.",
+  "src/identity-platform.ts",
+  "const deadline = AbortSignal.timeout(this.#timeoutMs)",
+  "Identity Platform token acquisition and API work must share one request deadline.",
 );
+
+// The state in the emailed link is encrypted and purpose-separated; scanners may
+// follow GET without consuming the OOB code or mutating membership. Only the
+// explicit, same-origin POST can verify and promote.
+for (const needle of ["AES-GCM", "HKDF", "additionalData(purpose)"]) {
+  await requireContains(
+    "src/waitlist-confirmation.ts",
+    needle,
+    "Confirmation state must remain encrypted and purpose-separated.",
+  );
+}
+for (const retiredRoute of ["/api/waitlist/challenge", "/api/waitlist/activate"]) {
+  await rejectContains(
+    "src/server.ts",
+    retiredRoute,
+    "The retired split challenge/activation surface must stay removed.",
+  );
+}
+for (const attribute of ["Secure", "HttpOnly", "SameSite=Strict"]) {
+  await requireContains(
+    "src/server.ts",
+    attribute,
+    "The short-lived browser proof cookie must retain all security attributes.",
+  );
+}
+await requireOrderedBetween(
+  "src/server.ts",
+  "async function handleWaitlistConfirm(",
+  "function confirmationCookie(",
+  [
+    'const proofCookie = cookieValue(',
+    "proof = await codec.openBrowserProof(",
+    "state = await codec.openLink(",
+    'key: "waitlist:assessment-global"',
+    "await recaptcha.assess(",
+    'key: "waitlist:confirm-global"',
+    "await dispatcher.verifyEmailLink(",
+    "await store.confirm(",
+  ],
+  "Confirmation must authenticate the mailed proof and bot before spending provider quota or touching membership.",
+);
+await requireOrderedBetween(
+  "src/server.ts",
+  "async function handleWaitlist(",
+  "function handleWaitlistConfig(",
+  [
+    "decision = await quota.consume(assessmentRules",
+    "await recaptcha.assess(",
+    "decision = await quota.consume(deliveryRules",
+    "await submitWaitlist(",
+    "await dispatcher.sendSignInLink(",
+  ],
+  "Join must spend assessment budget, attest, spend delivery budget, store, and dispatch in that order.",
+);
+await rejectContains(
+  "src/server.ts",
+  "result.outcome",
+  "Storage membership outcomes must never influence the public response.",
+);
+await requireContains(
+  "src/config.ts",
+  'waitlistActivationEnabled && waitlistBackend !== "firestore"',
+  "An enabled ownership flow must require the durable Firestore CAS backend.",
+);
+await requireContains(
+  "src/config.ts",
+  'url.pathname !== "/api/waitlist/confirm"',
+  "The Identity Platform return URL must be the exact canonical confirmation endpoint.",
+);
+
+// Bot proof is project-scoped, action-bound, hostname-bound, fresh, and scored.
+for (const needle of [
+  "recaptchaenterprise.googleapis.com/v1/projects/",
+  "properties?.valid !== true",
+  "properties.action !== expectedAction",
+  "!this.#allowedHostnames.has(hostname)",
+  "score < this.#minimumScore",
+]) {
+  await requireContains(
+    "src/recaptcha.ts",
+    needle,
+    "reCAPTCHA Enterprise assessment validation must remain fail closed.",
+  );
+}
+
+// The public site key is created in the same reviewed plan, never copied from a
+// dashboard or secret. Terraform and the backend each enforce a narrower part
+// of the trust boundary: score-key/domain settings at Google, exact project,
+// site-key, action, hostname, freshness, and score in the application.
+for (const needle of [
+  'resource "google_project_service" "recaptcha_enterprise"',
+  'service = "recaptchaenterprise.googleapis.com"',
+  'resource "google_recaptcha_enterprise_key" "waitlist"',
+  'deletion_policy = "PREVENT"',
+  'integration_type  = "SCORE"',
+  'allow_all_domains = false',
+  'allow_amp_traffic = false',
+  'allowed_domains   = ["medlock.ai"]',
+  "RECAPTCHA_SITE_KEY = google_recaptcha_enterprise_key.waitlist.name",
+]) {
+  await requireContains(
+    "infra/terraform/prod/main.tf",
+    needle,
+    "The reCAPTCHA score key must remain managed, canonical-domain-bound, and wired by resource identity.",
+  );
+}
+await requireContains(
+  "infra/terraform/bootstrap/main.tf",
+  '"recaptchaenterprise.googleapis.com"',
+  "The reviewed bootstrap must enable the reCAPTCHA Enterprise API.",
+);
+for (const forbidden of [
+  "allow_all_domains = true",
+  "testing_options",
+  "testing_score",
+  "testing_challenge",
+]) {
+  await rejectContains(
+    "infra/terraform/prod/main.tf",
+    forbidden,
+    "Production reCAPTCHA must not use unrestricted domains or deterministic test behavior.",
+  );
+}
 await rejectContains(
   "infra/terraform/prod/main.tf",
   "WAITLIST_ACTIVATION_ENABLED",
-  "Production must not enable activation before the live exchange has been proved.",
-);
-await requireContains(
-  "infra/terraform/prod/main.tf",
-  "password_required = false",
-  "Identity Platform must use email-link sign-in; no password may be set for this project.",
-);
-await requireContains(
-  "infra/terraform/prod/main.tf",
-  "authorized_domains",
-  "Sign-in links must be restricted to authorized return domains.",
-);
-// A token stays parseable for an hour; promotion must require a much fresher
-// proof than that.
-await requireContains(
-  "src/identity-token.ts",
-  "identity token authentication is too old to activate",
-  "Activation must bound how recently ownership was proved, not merely that the token has not expired.",
+  "Activation must remain absent until the protected infrastructure apply and live mailbox proof succeed.",
 );
 
-await requireContains(
-  "src/server.ts",
-  "quota.consume(quotaRules, now())",
-  "The authoritative waitlist quota must commit every bucket in one atomic call.",
-);
 await requireContains(
   "src/waitlist.ts",
   'flag: "wx"',
   "The file waitlist store must create-if-absent rather than read then write.",
 );
-await requireContains(
-  "src/firestore.ts",
-  "response.status === 409",
-  "Firestore waitlist creation must let the server decide existence, via 409.",
-);
+for (const needle of [
+  "await this.#client.beginTransaction(deadline)",
+  "await this.#client.batchGet([name], transaction, deadline)",
+  "verify: name",
+  'outcome = "refreshed"',
+]) {
+  await requireContains(
+    "src/waitlist.ts",
+    needle,
+    "Waitlist preparation must use one fixed Firestore transaction shape and refresh expired claims.",
+  );
+}
 // F-02. Whether an address was already present is internal state. Publishing it
 // anywhere a caller can see -- a body field, a status, a header, or a message on
 // the page -- rebuilds the enumeration oracle.
@@ -233,5 +338,31 @@ async function rejectExternalReferences(path: string, sameOriginPrefix: string, 
   const text = await readFile(join(root, path), "utf8");
   if (text.replaceAll(sameOriginPrefix, "").includes("https://")) {
     failures.push(`${path}: ${message}`);
+  }
+}
+
+async function requireOrderedBetween(
+  path: string,
+  start: string,
+  end: string,
+  needles: readonly string[],
+  message: string,
+): Promise<void> {
+  const text = await readFile(join(root, path), "utf8");
+  const startAt = text.indexOf(start);
+  const endAt = text.indexOf(end, startAt + start.length);
+  if (startAt < 0 || endAt < 0) {
+    failures.push(`${path}: ${message}`);
+    return;
+  }
+  const section = text.slice(startAt, endAt);
+  let cursor = 0;
+  for (const needle of needles) {
+    const at = section.indexOf(needle, cursor);
+    if (at < 0) {
+      failures.push(`${path}: ${message}`);
+      return;
+    }
+    cursor = at + needle.length;
   }
 }

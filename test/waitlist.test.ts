@@ -24,10 +24,14 @@ describe("waitlist", () => {
       },
       new Date("2026-06-01T12:00:00.000Z"),
     );
-    const duplicate = await submitWaitlist(store, {
-      clientId: "signed-client-one",
-      email: "person@example.com",
-    });
+    const duplicate = await submitWaitlist(
+      store,
+      {
+        clientId: "signed-client-one",
+        email: "person@example.com",
+      },
+      new Date("2026-06-02T12:00:00.000Z"),
+    );
 
     expect(first.ok).toBe(true);
     expect(duplicate.ok).toBe(true);
@@ -74,43 +78,45 @@ describe("waitlist", () => {
     expect(normalizeEmail(" Collin@Example.Com ")).toBe("collin@example.com");
   });
 
-  test("creates through Firestore with create-if-absent and reads 409 as duplicate", async () => {
+  test("prepares new, live, and expired Firestore entries with one fixed transaction shape", async () => {
     const requestedUrls: string[] = [];
-    let existing = false;
+    const committedWrites: unknown[] = [];
+    let fields: Record<string, { stringValue?: string; timestampValue?: string }> | undefined;
+    let version = 0;
+    const versionStamp = () => `2026-09-01T12:00:0${version}.000000Z`;
+
     const fetcher: FetchLike = async (input, init) => {
       const url = String(input);
       requestedUrls.push(url);
-
       if (url.includes("metadata.google.internal")) {
-        return Response.json({ access_token: "token", expires_in: 3600 });
+        return Response.json({ access_token: "token", expires_in: 3_600 });
       }
-
       expect(init?.method).toBe("POST");
       expect(init?.headers).toMatchObject({ Authorization: "Bearer token" });
-      // documentId in the query string is what makes this a create, not a
-      // write: Firestore refuses it if the document is already there.
-      expect(url).toContain("documentId=");
-      const document = JSON.parse(String(init?.body)) as {
-        fields?: Record<string, { stringValue?: string; timestampValue?: string }>;
-      };
-      expect(document.fields?.clientHash?.stringValue).toMatch(/^[0-9a-f]{64}$/);
-      expect(document.fields?.status?.stringValue).toBe("pending");
-      expect(document.fields?.expiresAt?.timestampValue).toBe("2026-07-01T12:00:00.000Z");
-      expect(document.fields?.confirmedAt).toBeUndefined();
-      if (existing) {
-        // The exact payload Firestore returns, captured from the emulator.
-        // The `code` is part of it, and the parser insists on it: a body that
-        // omits the code is not a well-formed statement about the write.
-        return Response.json({
-          error: {
-            code: 409,
-            message: "entity already exists: EntityRef[partitionRef=dev~p, path=/waitlist/x]",
-            status: "ALREADY_EXISTS",
-          },
-        }, { status: 409 });
+      if (url.endsWith(":beginTransaction")) {
+        return Response.json({ transaction: `tx-${requestedUrls.length}` });
       }
-      existing = true;
-      return Response.json({ name: "stored" });
+      if (url.endsWith(":batchGet")) {
+        const name = (JSON.parse(String(init?.body)) as { documents: string[] }).documents[0]!;
+        return Response.json([
+          fields === undefined
+            ? { missing: name }
+            : { found: { fields, name, updateTime: versionStamp() } },
+        ]);
+      }
+      if (url.endsWith(":commit")) {
+        const write = (JSON.parse(String(init?.body)) as { writes: unknown[] }).writes[0] as {
+          update?: { fields?: typeof fields };
+          verify?: string;
+        };
+        committedWrites.push(write);
+        if (write.update?.fields !== undefined) {
+          fields = write.update.fields;
+          version += 1;
+        }
+        return Response.json({ writeResults: [{}] });
+      }
+      throw new Error(`unexpected Firestore request: ${url}`);
     };
     const store = new FirestoreWaitlistStore({
       client: new FirestoreClient({ databaseId: "(default)", fetcher, projectId: "medlock-1025243085" }),
@@ -118,16 +124,83 @@ describe("waitlist", () => {
     });
 
     const submission = { clientId: "signed-firestore-client", email: "firestore@example.com" };
-    const at = new Date("2026-06-01T12:00:00.000Z");
-    const first = await submitWaitlist(store, submission, at);
-    const second = await submitWaitlist(store, submission, at);
+    const first = await submitWaitlist(store, submission, new Date("2026-06-01T12:00:00.000Z"));
+    const second = await submitWaitlist(store, submission, new Date("2026-06-02T12:00:00.000Z"));
+    const refreshed = await submitWaitlist(store, submission, new Date("2026-08-01T12:00:00.000Z"));
 
     expect(first.ok && first.outcome).toBe("created");
     expect(second.ok && second.outcome).toBe("duplicate");
-    // Never a read before the write: the only requests are the token fetch and
-    // the two creates.
-    expect(requestedUrls.filter((url) => url.includes("/documents/waitlist_preview_12"))).toHaveLength(2);
-    expect(requestedUrls.every((url) => !url.match(/documents\/waitlist_preview_12\/[0-9a-f]{64}$/))).toBe(true);
+    expect(refreshed.ok && refreshed.outcome).toBe("refreshed");
+    // Every state uses begin/read/commit. A live duplicate commits a no-op
+    // verify, while a missing or expired entry commits one conditional update.
+    expect(requestedUrls.filter((url) => !url.includes("metadata.google.internal"))).toHaveLength(9);
+    expect(committedWrites.map((write) => "verify" in (write as object))).toEqual([false, true, false]);
+    expect(fields?.status?.stringValue).toBe("pending");
+    expect(fields?.expiresAt?.timestampValue).toBe("2026-08-31T12:00:00.000Z");
+  });
+
+  test("bounds a Firestore preparation whose first request never answers", async () => {
+    const store = new FirestoreWaitlistStore({
+      client: new FirestoreClient({
+        databaseId: "(default)",
+        fetcher: async (_input, init) =>
+          await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+          }),
+        projectId: "medlock-1025243085",
+      }),
+      collection: "waitlist",
+      deadlineMs: 20,
+    });
+    const startedAt = performance.now();
+    await expect(
+      submitWaitlist(
+        store,
+        { clientId: "client", email: "deadline@example.com" },
+        new Date("2026-09-01T12:00:00.000Z"),
+      ),
+    ).rejects.toThrow(/deadline/);
+    expect(performance.now() - startedAt).toBeLessThan(500);
+  });
+
+  test("bounds a Firestore confirmation whose first request never answers", async () => {
+    const store = new FirestoreWaitlistStore({
+      client: new FirestoreClient({
+        databaseId: "(default)",
+        fetcher: async (_input, init) =>
+          await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+              once: true,
+            });
+          }),
+        projectId: "medlock-1025243085",
+      }),
+      collection: "waitlist",
+      deadlineMs: 20,
+    });
+    const startedAt = performance.now();
+    await expect(
+      store.confirm("d".repeat(64), "subject", Date.parse("2026-09-01T12:00:00.000Z")),
+    ).rejects.toThrow(/deadline/);
+    expect(performance.now() - startedAt).toBeLessThan(500);
+  });
+
+  test("refuses an oversized Firestore document before interpreting it", async () => {
+    const store = new FirestoreWaitlistStore({
+      client: new FirestoreClient({
+        databaseId: "(default)",
+        fetcher: async (input) =>
+          String(input).includes("metadata.google.internal")
+            ? Response.json({ access_token: "token", expires_in: 3_600 })
+            : new Response("x".repeat(262_145)),
+        projectId: "medlock-1025243085",
+      }),
+      collection: "waitlist",
+    });
+
+    await expect(
+      store.confirm("d".repeat(64), "subject", Date.parse("2026-09-01T12:00:00.000Z")),
+    ).rejects.toThrow(/oversized/);
   });
 
 });

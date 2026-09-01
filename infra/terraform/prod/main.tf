@@ -33,6 +33,11 @@ module "site" {
     WAITLIST_BACKEND               = "firestore"
     IDENTITY_PLATFORM_AUDIENCE     = "medlock-1025243085"
     IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/api/waitlist/confirm"
+    RECAPTCHA_PROJECT_ID           = "medlock-1025243085"
+    # A reCAPTCHA Enterprise site key is public by design. Deriving it from the
+    # managed resource still matters: it prevents a copied or hand-entered key
+    # from silently pointing browser tokens at a different project.
+    RECAPTCHA_SITE_KEY = google_recaptcha_enterprise_key.waitlist.name
   }
   runtime_secret_ids               = var.runtime_secret_ids
   runtime_secret_accessor_ids      = var.runtime_secret_accessor_ids
@@ -94,7 +99,9 @@ resource "google_firestore_field" "waitlist_quota_ttl" {
 # restrictions are not a fix -- they are a browser convention, not an
 # authorization boundary. The service dispatches from the backend with its own
 # runtime identity instead, so a challenge can only be sent after the request
-# has already passed the shared quota and a membership check.
+# has already passed the shared quota and reCAPTCHA assessment. Dispatch stays
+# membership-independent so neither the response nor provider side effects form
+# an address-existence oracle.
 resource "google_project_service" "identity_toolkit" {
   project = var.project_id
   service = "identitytoolkit.googleapis.com"
@@ -129,4 +136,36 @@ resource "google_identity_platform_config" "default" {
   ]
 
   depends_on = [google_project_service.identity_toolkit]
+}
+
+# Browser attestation is scored server-side with the runtime service account;
+# there is no reCAPTCHA secret and no API key. The site key below is intentionally
+# public, domain-restricted at Google, and checked again against an exact hostname,
+# action, age, validity bit, and score in src/recaptcha.ts. Google implicitly
+# allows subdomains of an allowed apex, so the exact backend hostname check is the
+# narrower authorization boundary.
+resource "google_project_service" "recaptcha_enterprise" {
+  project = var.project_id
+  service = "recaptchaenterprise.googleapis.com"
+
+  disable_on_destroy = false
+}
+
+resource "google_recaptcha_enterprise_key" "waitlist" {
+  project      = var.project_id
+  display_name = "Medlock waitlist ownership"
+
+  # Accidental removal would make both join and confirmation fail closed. Refuse
+  # to delete it through an ordinary apply rather than silently creating an
+  # availability incident and invalidating every in-flight browser token.
+  deletion_policy = "PREVENT"
+
+  web_settings {
+    integration_type  = "SCORE"
+    allow_all_domains = false
+    allow_amp_traffic = false
+    allowed_domains   = ["medlock.ai"]
+  }
+
+  depends_on = [google_project_service.recaptcha_enterprise]
 }

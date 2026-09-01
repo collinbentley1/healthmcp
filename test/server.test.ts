@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getRuntimeConfig } from "../src/config.ts";
 import { createHandler, startServer } from "../src/server.ts";
 import { resolveWaitlistClient } from "../src/waitlist-client.ts";
+import { WaitlistConfirmationCodec } from "../src/waitlist-confirmation.ts";
+import { MemoryWaitlistQuota } from "../src/waitlist-quota.ts";
 import { MemoryWaitlistStore, type WaitlistStore } from "../src/waitlist.ts";
 
 const UTF8 = new TextEncoder();
@@ -17,6 +22,31 @@ const config = getRuntimeConfig({
   PORT: "0",
   PUBLIC_DIR: `${import.meta.dir}/../public`,
 });
+const waitlistConfig = { ...config, waitlistActivationEnabled: true };
+
+function enabledWaitlistDependencies(
+  identitySecret: Uint8Array,
+  store: WaitlistStore = new MemoryWaitlistStore(),
+) {
+  return {
+    confirmationCodec: new WaitlistConfirmationCodec([identitySecret]),
+    identityDispatcher: {
+      sendSignInLink: async () => undefined,
+      verifyEmailLink: async () => "member@example.com",
+    },
+    recaptcha: {
+      assess: async (_token: string, action: string) => ({
+        action,
+        hostname: "medlock.ai",
+        score: 0.9,
+      }),
+    },
+    sleep: async () => undefined,
+    waitlistIdentitySecrets: [identitySecret],
+    waitlistQuota: new MemoryWaitlistQuota(),
+    waitlistStore: store,
+  };
+}
 
 delete Bun.env.PLATFORM_DEPLOY_NONCE;
 
@@ -32,12 +62,56 @@ describe("server", () => {
     expect(favicon.headers.get("Content-Type")).toBe("image/svg+xml");
   });
 
+  test("never follows a public-directory symlink outside its static root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "medlock-static-"));
+    const publicDir = join(root, "public");
+    const privateFile = join(root, "private.txt");
+    await mkdir(publicDir);
+    await writeFile(privateFile, "must not be served");
+    await symlink(privateFile, join(publicDir, "leak.txt"));
+    try {
+      const response = await createHandler({ config: { ...config, publicDir } })(
+        new Request("http://localhost/leak.txt"),
+      );
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe("not found");
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+
+  test("never caches or leaks a referrer from the confirmation page", async () => {
+    const response = await createHandler({ config })(
+      new Request("http://localhost/waitlist/confirm"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(await response.text()).toContain('<meta name="referrer" content="no-referrer" />');
+  });
+
   test("serves the platform liveness probe at /livez", async () => {
     const handler = createHandler({ config });
     const response = await handler(new Request("http://localhost/livez"));
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
+  });
+
+  test("rejects untrusted hosts before static and application routes", async () => {
+    const handler = createHandler({ config });
+
+    for (const path of ["/", "/api/waitlist/config", "/api/mcp"]) {
+      const response = await handler(
+        new Request(`https://attacker.example${path}`, {
+          headers: { Host: "attacker.example" },
+        }),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe("untrusted host");
+      expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    }
   });
 
   test("limits liveness and static routes to safe read methods", async () => {
@@ -172,17 +246,16 @@ describe("server", () => {
   });
 
   test("accepts waitlist JSON and ignores spoofed forwarding headers when rate limiting", async () => {
+    const identitySecret = new Uint8Array(32).fill(7);
     const handler = createHandler({
-      config,
-      sleep: async () => {},
-      waitlistIdentitySecrets: [new Uint8Array(32).fill(7)],
-      waitlistStore: new MemoryWaitlistStore(),
+      config: waitlistConfig,
+      ...enabledWaitlistDependencies(identitySecret),
     });
     let requestIndex = 0;
     const request = (cookie?: string) => {
       const index = requestIndex++;
       return new Request("http://localhost/api/waitlist", {
-        body: JSON.stringify({ email: `person-${index}@example.com` }),
+        body: JSON.stringify({ email: `person-${index}@example.com`, recaptchaToken: `token-${index}` }),
         headers: {
           ...(cookie ? { Cookie: cookie } : {}),
           "Content-Type": "application/json",
@@ -212,17 +285,17 @@ describe("server", () => {
   });
 
   test("keeps distinct clients independent without consulting Bun's proxy socket", async () => {
+    const identitySecret = new Uint8Array(32).fill(8);
     const server = startServer(
-      { ...config, port: 0 },
-      {
-        waitlistIdentitySecrets: [new Uint8Array(32).fill(8)],
-        waitlistStore: new MemoryWaitlistStore(),
-      },
+      { ...waitlistConfig, port: 0 },
+      enabledWaitlistDependencies(identitySecret),
     );
 
     try {
-      const first = await fetch(new URL("/api/waitlist", server.url), {
-        body: JSON.stringify({ email: "first@example.com" }),
+      const loopback = new URL(server.url);
+      loopback.hostname = "127.0.0.1";
+      const first = await fetch(new URL("/api/waitlist", loopback), {
+        body: JSON.stringify({ email: "first@example.com", recaptchaToken: "token-first" }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
@@ -231,8 +304,8 @@ describe("server", () => {
       expect(firstCookie).toStartWith("medlock_waitlist_client=");
 
       for (let index = 0; index < 4; index += 1) {
-        const response = await fetch(new URL("/api/waitlist", server.url), {
-          body: JSON.stringify({ email: `first-${index}@example.com` }),
+        const response = await fetch(new URL("/api/waitlist", loopback), {
+          body: JSON.stringify({ email: `first-${index}@example.com`, recaptchaToken: `token-${index}` }),
           headers: {
             Cookie: firstCookie!,
             "Content-Type": "application/json",
@@ -245,16 +318,16 @@ describe("server", () => {
 
       expect(
         (
-          await fetch(new URL("/api/waitlist", server.url), {
-            body: JSON.stringify({ email: "first-spill@example.com" }),
+          await fetch(new URL("/api/waitlist", loopback), {
+            body: JSON.stringify({ email: "first-spill@example.com", recaptchaToken: "token-spill" }),
             headers: { Cookie: firstCookie!, "Content-Type": "application/json" },
             method: "POST",
           })
         ).status,
       ).toBe(429);
 
-      const independent = await fetch(new URL("/api/waitlist", server.url), {
-        body: JSON.stringify({ email: "second@example.com" }),
+      const independent = await fetch(new URL("/api/waitlist", loopback), {
+        body: JSON.stringify({ email: "second@example.com", recaptchaToken: "token-second" }),
         headers: {
           "Content-Type": "application/json",
           "X-Forwarded-For": "203.0.113.0",
@@ -269,15 +342,14 @@ describe("server", () => {
   });
 
   test("caps cookie-discarding callers before they can rotate through the global budget", async () => {
+    const identitySecret = new Uint8Array(32).fill(9);
     const handler = createHandler({
-      config,
-      sleep: async () => {},
-      waitlistIdentitySecrets: [new Uint8Array(32).fill(9)],
-      waitlistStore: new MemoryWaitlistStore(),
+      config: waitlistConfig,
+      ...enabledWaitlistDependencies(identitySecret),
     });
     const request = (index: number) =>
       new Request("http://localhost/api/waitlist", {
-        body: JSON.stringify({ email: `discarded-${index}@example.com` }),
+        body: JSON.stringify({ email: `discarded-${index}@example.com`, recaptchaToken: `token-${index}` }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
@@ -294,10 +366,8 @@ describe("server", () => {
   test("caps aggregate waitlist traffic across authenticated client cookies", async () => {
     const identitySecret = new Uint8Array(32).fill(10);
     const handler = createHandler({
-      config,
-      sleep: async () => {},
-      waitlistIdentitySecrets: [identitySecret],
-      waitlistStore: new MemoryWaitlistStore(),
+      config: waitlistConfig,
+      ...enabledWaitlistDependencies(identitySecret),
     });
     const cookies = Array.from({ length: 13 }, () => {
       const identity = resolveWaitlistClient(
@@ -312,7 +382,7 @@ describe("server", () => {
     });
     const request = (cookie: string, index: number) =>
       new Request("http://localhost/api/waitlist", {
-        body: JSON.stringify({ email: `aggregate-${index}@example.com` }),
+        body: JSON.stringify({ email: `aggregate-${index}@example.com`, recaptchaToken: `token-${index}` }),
         headers: { Cookie: cookie, "Content-Type": "application/json" },
         method: "POST",
       });
@@ -341,7 +411,10 @@ describe("server", () => {
   });
 
   test("rejects an oversized waitlist body before parsing or persistence", async () => {
-    const handler = createHandler({ config, waitlistStore: new MemoryWaitlistStore() });
+    const handler = createHandler({
+      config: waitlistConfig,
+      ...enabledWaitlistDependencies(new Uint8Array(32).fill(11)),
+    });
     const response = await handler(
       new Request("http://localhost/api/waitlist", {
         body: JSON.stringify({ email: `${"a".repeat(9_000)}@example.com` }),
@@ -355,9 +428,12 @@ describe("server", () => {
   });
 
   test("rejects CORS-safelisted content types that merely contain application/json", async () => {
-    const response = await createHandler({ config, waitlistStore: new MemoryWaitlistStore() })(
+    const response = await createHandler({
+      config: waitlistConfig,
+      ...enabledWaitlistDependencies(new Uint8Array(32).fill(12)),
+    })(
       new Request("http://localhost/api/waitlist", {
-        body: JSON.stringify({ email: "person@example.com" }),
+        body: JSON.stringify({ email: "person@example.com", recaptchaToken: "token" }),
         headers: { "Content-Type": "text/plain; x=application/json", Origin: "https://attacker.example" },
         method: "POST",
       }),
@@ -368,24 +444,25 @@ describe("server", () => {
     expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
   });
 
-  test("keeps waitlist store failures inside the hardened API boundary", async () => {
+  test("fails closed without exposing waitlist store failures", async () => {
     const throwingStore: WaitlistStore = {
       confirm: () => Promise.reject(new Error("private waitlist marker")),
       create: () => Promise.reject(new Error("private waitlist marker")),
-      pendingExists: () => Promise.reject(new Error("private waitlist marker")),
-      emailFor: () => Promise.reject(new Error("private waitlist marker")),
     };
-    const response = await createHandler({ config, waitlistStore: throwingStore })(
+    const response = await createHandler({
+      config: waitlistConfig,
+      ...enabledWaitlistDependencies(new Uint8Array(32).fill(13), throwingStore),
+    })(
       new Request("http://localhost/api/waitlist", {
-        body: JSON.stringify({ email: "person@example.com" }),
+        body: JSON.stringify({ email: "person@example.com", recaptchaToken: "token" }),
         headers: { "Content-Type": "application/json", Origin: "http://localhost:3000" },
         method: "POST",
       }),
     );
     const body = await response.text();
 
-    expect(response.status).toBe(500);
-    expect(body).toBe('{"error":"internal server error"}');
+    expect(response.status).toBe(503);
+    expect(body).toBe('{"error":"waitlist temporarily unavailable"}');
     expect(body).not.toContain("private waitlist marker");
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3000");
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");

@@ -1,6 +1,15 @@
-import { extname, join, normalize } from "node:path";
+import { realpath, stat } from "node:fs/promises";
+import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { BUILT_PUBLIC_DIR, getRuntimeConfig, type RuntimeConfig } from "./config.ts";
-import { corsHeaders, json, shouldRedirectToCanonical, text, withSecurityHeaders, type JsonResponseOptions } from "./http.ts";
+import {
+  corsHeaders,
+  isTrustedHost,
+  json,
+  shouldRedirectToCanonical,
+  text,
+  withSecurityHeaders,
+  type JsonResponseOptions,
+} from "./http.ts";
 import { createMcpEndpoint, type McpEndpoint } from "./mcp.ts";
 import { InMemoryRateLimiter, type RateLimitRule } from "./rate-limit.ts";
 import {
@@ -14,9 +23,17 @@ import {
   type QuotaRule,
   type WaitlistQuota,
 } from "./waitlist-quota.ts";
-import { IdentityTokenVerifier } from "./identity-token.ts";
 import { IdentityPlatformClient } from "./identity-platform.ts";
-import { createWaitlistStore, normalizeEmail, sha256, submitWaitlist, type WaitlistStore } from "./waitlist.ts";
+import { RecaptchaEnterpriseClient } from "./recaptcha.ts";
+import { WaitlistConfirmationCodec } from "./waitlist-confirmation.ts";
+import {
+  createWaitlistStore,
+  isValidEmail,
+  normalizeEmail,
+  sha256,
+  submitWaitlist,
+  type WaitlistStore,
+} from "./waitlist.ts";
 
 type ServerDependencies = {
   readonly config?: RuntimeConfig;
@@ -28,11 +45,15 @@ type ServerDependencies = {
   readonly waitlistStore?: WaitlistStore;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly monotonicNow?: () => number;
-  readonly identityVerifier?: { verify: IdentityTokenVerifier["verify"] };
+  readonly confirmationCodec?: Pick<
+    WaitlistConfirmationCodec,
+    "openBrowserProof" | "openLink" | "sealBrowserProof" | "sealLink"
+  >;
   readonly identityDispatcher?: {
-    exchangeSignInLink: IdentityPlatformClient["exchangeSignInLink"];
     sendSignInLink: IdentityPlatformClient["sendSignInLink"];
+    verifyEmailLink: IdentityPlatformClient["verifyEmailLink"];
   };
+  readonly recaptcha?: Pick<RecaptchaEnterpriseClient, "assess">;
 };
 
 export const MAX_REQUEST_BODY_SIZE = 1_048_576;
@@ -64,11 +85,15 @@ function waitlistTimingJitterMs(): number {
 // be submitted, which is what stops the endpoint being used to send repeated
 // confirmation mail to someone who never asked for it.
 export const WAITLIST_QUOTA_LIMITS = {
+  assessmentGlobal: { limit: 120, windowSeconds: 60 },
   client: { limit: 5, windowSeconds: 60 },
-  email: { limit: 3, windowSeconds: 3_600 },
+  email: { limit: 2, windowSeconds: 86_400 },
   global: { limit: 60, windowSeconds: 60 },
   unestablished: { limit: 5, windowSeconds: 60 },
 } as const;
+const WAITLIST_JOIN_ACTION = "waitlist_join";
+const WAITLIST_CONFIRM_ACTION = "waitlist_confirm";
+const CONFIRMATION_COOKIE = "__Host-medlock-waitlist-confirmation";
 const UTF8 = new TextEncoder();
 
 const CONTENT_TYPES: Readonly<Record<string, string>> = {
@@ -104,17 +129,19 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
   const sleep = dependencies.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
-  // Absent audience means the ownership flow is not provisioned. Activation
-  // then refuses outright rather than constructing a verifier that would trust
-  // an audience nobody configured.
-  const identityVerifier = dependencies.identityVerifier ??
-    (config.identityPlatformAudience === undefined
+  const waitlistIdentitySecrets =
+    dependencies.waitlistIdentitySecrets ??
+    (config.waitlistIdentitySecrets.length > 0
+      ? config.waitlistIdentitySecrets
+      : [createWaitlistIdentitySecret()]);
+  const confirmationCodec = dependencies.confirmationCodec ??
+    (waitlistIdentitySecrets.length === 0
       ? undefined
-      : new IdentityTokenVerifier({ audience: config.identityPlatformAudience }));
-  // Dispatch needs both halves: the project whose tokens will be trusted, and
-  // the destination the mailed link may return to. Missing either means the
-  // ownership flow is not provisioned, and the challenge endpoint refuses for
-  // every address alike rather than half-working for some.
+      : new WaitlistConfirmationCodec(waitlistIdentitySecrets));
+  // Dispatch needs both halves: the project used by the OAuth-only ownership
+  // calls, and the destination the mailed link may return to. Missing either
+  // means the flow is not provisioned, and every address is refused alike rather
+  // than leaving a partially working verification path.
   const identityDispatcher = dependencies.identityDispatcher ??
     (config.identityPlatformAudience === undefined ||
         config.identityPlatformContinueUrl === undefined
@@ -123,14 +150,17 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
         continueUrl: config.identityPlatformContinueUrl,
         projectId: config.identityPlatformAudience,
       }));
+  const recaptcha = dependencies.recaptcha ??
+    (config.recaptchaProjectId === undefined || config.recaptchaSiteKey === undefined
+      ? undefined
+      : new RecaptchaEnterpriseClient({
+        allowedHostnames: [config.canonicalHost, `www.${config.canonicalHost}`],
+        projectId: config.recaptchaProjectId,
+        siteKey: config.recaptchaSiteKey,
+      }));
   const rateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
   const mcpEndpoint = dependencies.mcpEndpoint ?? createMcpEndpoint(config);
   const now = dependencies.now ?? (() => new Date());
-  const waitlistIdentitySecrets =
-    dependencies.waitlistIdentitySecrets ??
-    (config.waitlistIdentitySecrets.length > 0
-      ? config.waitlistIdentitySecrets
-      : [createWaitlistIdentitySecret()]);
 
   return async function handleRequest(request: Request): Promise<Response> {
     const healthUrl = new URL(request.url);
@@ -149,6 +179,10 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
       return request.method === "HEAD" ? withoutBody(response) : response;
     }
 
+    if (!isTrustedHost(request, config)) {
+      return text("untrusted host", { status: 400 });
+    }
+
     const canonicalRedirect = shouldRedirectToCanonical(request, config);
     if (canonicalRedirect) {
       return withSecurityHeaders(new Response(null, { headers: { Location: canonicalRedirect.href }, status: 308 }));
@@ -164,6 +198,9 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           waitlistStore,
           waitlistQuota,
           rateLimiter,
+          identityDispatcher,
+          confirmationCodec,
+          recaptcha,
           waitlistIdentitySecrets,
           now,
           sleep,
@@ -171,19 +208,8 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
         );
       }
 
-      if (url.pathname === "/api/waitlist/challenge") {
-        return await handleWaitlistChallenge(
-          request,
-          config,
-          waitlistStore,
-          waitlistQuota,
-          rateLimiter,
-          identityDispatcher,
-          waitlistIdentitySecrets,
-          now,
-          sleep,
-          monotonicNow,
-        );
+      if (url.pathname === "/api/waitlist/config") {
+        return handleWaitlistConfig(request, config, recaptcha);
       }
 
       if (url.pathname === "/api/waitlist/confirm") {
@@ -195,21 +221,8 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
           waitlistQuota,
           rateLimiter,
           identityDispatcher,
-          identityVerifier,
-          waitlistIdentitySecrets,
-          now,
-          sleep,
-          monotonicNow,
-        );
-      }
-
-      if (url.pathname === "/api/waitlist/activate") {
-        return await handleWaitlistActivation(
-          request,
-          config,
-          waitlistStore,
-          waitlistQuota,
-          identityVerifier,
+          confirmationCodec,
+          recaptcha,
           waitlistIdentitySecrets,
           now,
         );
@@ -225,6 +238,10 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
 
       if (url.pathname === "/scan") {
         return await serveStatic("/scan.html", config, request.method === "HEAD");
+      }
+
+      if (url.pathname === "/waitlist/confirm") {
+        return await serveStatic("/waitlist-confirm.html", config, request.method === "HEAD");
       }
 
       return await serveStatic(url.pathname, config, request.method === "HEAD");
@@ -271,6 +288,11 @@ async function handleWaitlist(
   store: WaitlistStore,
   quota: WaitlistQuota,
   rateLimiter: InMemoryRateLimiter,
+  dispatcher: {
+    sendSignInLink: IdentityPlatformClient["sendSignInLink"];
+  } | undefined,
+  confirmationCodec: Pick<WaitlistConfirmationCodec, "sealLink"> | undefined,
+  recaptcha: Pick<RecaptchaEnterpriseClient, "assess"> | undefined,
   identitySecrets: readonly Uint8Array[],
   now: () => Date,
   sleep: (ms: number) => Promise<void>,
@@ -283,6 +305,16 @@ async function handleWaitlist(
   if (request.method !== "POST") {
     return apiJson({ error: "method not allowed" }, request, config, { headers: { Allow: "POST, OPTIONS" }, status: 405 });
   }
+  if (
+    !config.waitlistActivationEnabled ||
+    dispatcher === undefined ||
+    confirmationCodec === undefined ||
+    recaptcha === undefined
+  ) {
+    return apiJson({ error: "waitlist verification is not available" }, request, config, {
+      status: 503,
+    });
+  }
 
   const client = resolveWaitlistClient(request, identitySecrets);
   const respond = (response: Response): Response => withWaitlistClientCookie(response, client.setCookie);
@@ -292,7 +324,11 @@ async function handleWaitlist(
   // be the thing that decides.
   const localRules: RateLimitRule[] = [
     { key: `waitlist:client:${client.id}`, limit: WAITLIST_QUOTA_LIMITS.client.limit, windowMs: 60_000 },
-    { key: "waitlist:global", limit: WAITLIST_QUOTA_LIMITS.global.limit, windowMs: 60_000 },
+    {
+      key: "waitlist:assessment-global",
+      limit: WAITLIST_QUOTA_LIMITS.assessmentGlobal.limit,
+      windowMs: 60_000,
+    },
   ];
   if (!client.authenticated) {
     localRules.unshift({
@@ -321,35 +357,38 @@ async function handleWaitlist(
     return respond(apiJson({ error: "invalid JSON body" }, request, config, { status: 400 }));
   }
 
-  const body = parsedBody.value as { email?: unknown; source?: unknown } | undefined;
-  if (!body || typeof body.email !== "string") {
-    return respond(apiJson({ error: "email is required" }, request, config, { status: 400 }));
+  const body = parsedBody.value as {
+    email?: unknown;
+    recaptchaToken?: unknown;
+    source?: unknown;
+  } | undefined;
+  if (!body || typeof body.email !== "string" || typeof body.recaptchaToken !== "string") {
+    return respond(apiJson({ error: "email and verification are required" }, request, config, { status: 400 }));
+  }
+  const normalizedEmail = normalizeEmail(body.email);
+  if (!isValidEmail(normalizedEmail)) {
+    return respond(apiJson({ error: "Enter a valid email address." }, request, config, { status: 400 }));
   }
 
-  // The authoritative decision, shared by every instance. The per-address
-  // bucket is keyed by the hash, never the address, so the quota collection
-  // holds no readable email even for an operator.
-  const quotaRules: QuotaRule[] = [
+  // First bound assessment cost globally. These are distinct from the mail
+  // budgets below, so a flood of invalid attestation tokens cannot exhaust the
+  // capacity reserved for people who pass the bot check.
+  const assessmentRules: QuotaRule[] = [
     {
-      key: "waitlist:global",
-      limit: WAITLIST_QUOTA_LIMITS.global.limit,
-      windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
-    },
-    {
-      key: `waitlist:email:${sha256(normalizeEmail(body.email)).slice(0, 32)}`,
-      limit: WAITLIST_QUOTA_LIMITS.email.limit,
-      windowSeconds: WAITLIST_QUOTA_LIMITS.email.windowSeconds,
+      key: "waitlist:assessment-global",
+      limit: WAITLIST_QUOTA_LIMITS.assessmentGlobal.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.assessmentGlobal.windowSeconds,
     },
   ];
-  quotaRules.push(
+  assessmentRules.push(
     client.authenticated
       ? {
-        key: `waitlist:client:${client.id.toLowerCase()}`,
+        key: `waitlist:assessment-client:${client.id.toLowerCase()}`,
         limit: WAITLIST_QUOTA_LIMITS.client.limit,
         windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
       }
       : {
-        key: "waitlist:unestablished",
+        key: "waitlist:assessment-unestablished",
         limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
         windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
       },
@@ -357,7 +396,7 @@ async function handleWaitlist(
 
   let decision;
   try {
-    decision = await quota.consume(quotaRules, now());
+    decision = await quota.consume(assessmentRules, now());
   } catch (error) {
     // Fail closed. If the shared counter cannot be advanced, this instance has
     // no idea how much of the budget is already spent, and guessing in the
@@ -369,6 +408,59 @@ async function handleWaitlist(
         status: 503,
       }),
     );
+  }
+  if (!decision.allowed) {
+    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+    return client.authenticated ? respond(response) : response;
+  }
+
+  const observedAt = now();
+  try {
+    await recaptcha.assess(
+      body.recaptchaToken,
+      WAITLIST_JOIN_ACTION,
+      observedAt.getTime(),
+      request.headers.get("user-agent") ?? undefined,
+    );
+  } catch (error) {
+    console.error("waitlist attestation refused", error instanceof Error ? error.name : "unknown error");
+    return respond(apiJson({ error: "request could not be verified" }, request, config, { status: 403 }));
+  }
+
+  // The authoritative mail decision, shared by every instance. The address
+  // bucket is keyed by a hash, never by plaintext, and is only spent after a
+  // valid, single-use reCAPTCHA assessment.
+  const deliveryRules: QuotaRule[] = [
+    {
+      key: "waitlist:global",
+      limit: WAITLIST_QUOTA_LIMITS.global.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+    },
+    {
+      key: `waitlist:email:${sha256(normalizedEmail).slice(0, 32)}`,
+      limit: WAITLIST_QUOTA_LIMITS.email.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.email.windowSeconds,
+    },
+    client.authenticated
+      ? {
+        key: `waitlist:client:${client.id.toLowerCase()}`,
+        limit: WAITLIST_QUOTA_LIMITS.client.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+      }
+      : {
+        key: "waitlist:unestablished",
+        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
+      },
+  ];
+  try {
+    decision = await quota.consume(deliveryRules, observedAt);
+  } catch (error) {
+    console.error("waitlist delivery quota unavailable", error instanceof Error ? error.name : "unknown error");
+    return respond(apiJson({ error: "waitlist temporarily unavailable" }, request, config, {
+      headers: { "Retry-After": "60" },
+      status: 503,
+    }));
   }
   if (!decision.allowed) {
     const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
@@ -395,193 +487,75 @@ async function handleWaitlist(
     return respond(response);
   };
 
-  const result = await submitWaitlist(
-    store,
-    {
-      email: body.email,
-      clientId: client.id,
-      source: typeof body.source === "string" ? body.source : "site",
-      userAgent: request.headers.get("user-agent") ?? undefined,
-    },
-    now(),
-  );
+  try {
+    const result = await submitWaitlist(
+      store,
+      {
+        email: normalizedEmail,
+        clientId: client.id,
+        source: typeof body.source === "string" ? body.source : "site",
+        userAgent: request.headers.get("user-agent") ?? undefined,
+      },
+      observedAt,
+    );
+    if (!result.ok) {
+      return await settle(apiJson({ error: result.error }, request, config, { status: result.status }));
+    }
 
-  if (!result.ok) {
-    return await settle(apiJson({ error: result.error }, request, config, { status: result.status }));
+    // The provider call happens for every accepted submission, including an
+    // already-present or already-confirmed address. There is no membership
+    // branch to infer from latency. Bot attestation and the global/address
+    // quotas are what make this standard double-opt-in send surface bounded.
+    const linkState = await confirmationCodec.sealLink(normalizedEmail, observedAt.getTime());
+    await dispatcher.sendSignInLink(normalizedEmail, linkState, observedAt.getTime());
+  } catch (error) {
+    console.error("waitlist submission unavailable", error instanceof Error ? error.name : "unknown error");
+    return await settle(apiJson({ error: "waitlist temporarily unavailable" }, request, config, {
+      headers: { "Retry-After": "60" },
+      status: 503,
+    }));
   }
 
-  // `result.outcome` is deliberately not read. Whether this created a pending
-  // entry or found one already there is internal state; publishing it is the
-  // enumeration oracle, whether it is published as a body field, a status code,
-  // a header, or a message on the page.
+  // Whether the store created, refreshed, or found the entry never leaves this
+  // process. The response is identical and a message was attempted in all
+  // cases, so neither bytes nor provider latency answer a membership question.
   return await settle(apiJson({ ok: true }, request, config, { status: 202 }));
 }
 
-// Challenge dispatch: the first half of the ownership flow.
-//
-// The endpoint sends a single-use, short-lived sign-in link to an address that
-// has already asked to be on the list. Two constraints shape all of it.
-//
-// It must not become a mail cannon. If any well-formed address could be typed
-// in and mailed, this endpoint would send attacker-chosen mail to
-// attacker-chosen strangers over this project's sending reputation, so a link
-// only goes to an address with a live pending entry.
-//
-// And it must not answer the membership question it necessarily asks. The
-// response is byte-identical and equal-cost whether the address is on the list,
-// absent, expired, already confirmed, or failed to send. The only place the
-// distinction ever surfaces is the mailbox itself, which is exactly the party
-// already entitled to know.
-async function handleWaitlistChallenge(
+
+function handleWaitlistConfig(
   request: Request,
   config: RuntimeConfig,
-  store: WaitlistStore,
-  quota: WaitlistQuota,
-  rateLimiter: InMemoryRateLimiter,
-  dispatcher: { sendSignInLink: IdentityPlatformClient["sendSignInLink"] } | undefined,
-  identitySecrets: readonly Uint8Array[],
-  now: () => Date,
-  sleep: (ms: number) => Promise<void>,
-  monotonicNow: () => number,
-): Promise<Response> {
-  if (request.method === "OPTIONS") {
-    return withSecurityHeaders(
-      new Response(null, { headers: corsHeaders(request, config), status: 204 }),
-    );
-  }
-  if (request.method !== "POST") {
+  recaptcha: Pick<RecaptchaEnterpriseClient, "assess"> | undefined,
+): Response {
+  if (request.method !== "GET" && request.method !== "HEAD") {
     return apiJson({ error: "method not allowed" }, request, config, {
-      headers: { Allow: "POST, OPTIONS" },
+      headers: { Allow: "GET, HEAD" },
       status: 405,
     });
   }
-  if (dispatcher === undefined) {
-    // Fail closed, and identically for everyone. Refusing here -- before the
-    // address is even parsed -- means an unprovisioned deployment cannot leak
-    // membership through the difference between "sent" and "could not send".
+  if (
+    !config.waitlistActivationEnabled ||
+    config.recaptchaSiteKey === undefined ||
+    recaptcha === undefined
+  ) {
     return apiJson({ error: "waitlist verification is not available" }, request, config, {
+      headers: { "Cache-Control": "no-store" },
       status: 503,
     });
   }
-
-  const client = resolveWaitlistClient(request, identitySecrets);
-  const respond = (response: Response): Response =>
-    withWaitlistClientCookie(response, client.setCookie);
-
-  const localRules: RateLimitRule[] = [
-    { key: `waitlist:client:${client.id}`, limit: WAITLIST_QUOTA_LIMITS.client.limit, windowMs: 60_000 },
-    { key: "waitlist:global", limit: WAITLIST_QUOTA_LIMITS.global.limit, windowMs: 60_000 },
-  ];
-  if (!client.authenticated) {
-    localRules.unshift({
-      key: "waitlist:unestablished",
-      limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-      windowMs: 60_000,
-    });
-  }
-  const local = rateLimiter.checkMany(localRules);
-  if (!local.allowed) {
-    const response = rateLimitedWaitlistResponse(request, config, local.retryAfterSeconds);
-    return client.authenticated ? respond(response) : response;
-  }
-
-  const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim()
-    .toLowerCase();
-  if (contentType !== "application/json") {
-    return respond(apiJson({ error: "expected application/json" }, request, config, { status: 415 }));
-  }
-  const parsedBody = await readBoundedJson(request, MAX_WAITLIST_BODY_SIZE);
-  if (parsedBody.kind === "too-large") {
-    return respond(apiJson({ error: "request body too large" }, request, config, { status: 413 }));
-  }
-  if (parsedBody.kind === "invalid") {
-    return respond(apiJson({ error: "invalid JSON body" }, request, config, { status: 400 }));
-  }
-  const body = parsedBody.value as { email?: unknown } | undefined;
-  if (!body || typeof body.email !== "string") {
-    return respond(apiJson({ error: "email is required" }, request, config, { status: 400 }));
-  }
-
-  const normalized = normalizeEmail(body.email);
-  const quotaRules: QuotaRule[] = [
+  const response = apiJson(
     {
-      key: "waitlist:global",
-      limit: WAITLIST_QUOTA_LIMITS.global.limit,
-      windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+      actions: { confirm: WAITLIST_CONFIRM_ACTION, join: WAITLIST_JOIN_ACTION },
+      siteKey: config.recaptchaSiteKey,
     },
-    {
-      key: `waitlist:email:${sha256(normalized).slice(0, 32)}`,
-      limit: WAITLIST_QUOTA_LIMITS.email.limit,
-      windowSeconds: WAITLIST_QUOTA_LIMITS.email.windowSeconds,
-    },
-    client.authenticated
-      ? {
-        key: `waitlist:client:${client.id.toLowerCase()}`,
-        limit: WAITLIST_QUOTA_LIMITS.client.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
-      }
-      : {
-        key: "waitlist:unestablished",
-        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
-      },
-  ];
-  let decision;
-  try {
-    decision = await quota.consume(quotaRules, now());
-  } catch {
-    // The shared limiter is the only thing standing between this endpoint and
-    // unmetered mail. If it cannot decide, nothing is sent.
-    return respond(apiJson({ error: "service unavailable" }, request, config, { status: 503 }));
-  }
-  if (!decision.allowed) {
-    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
-    return client.authenticated ? respond(response) : response;
-  }
-
-  // Everything past this point costs the same wall time and returns the same
-  // bytes, on the same monotonic clock the submit path uses.
-  const startedAt = monotonicNow();
-  const settle = async (response: Response): Promise<Response> => {
-    const elapsed = monotonicNow() - startedAt;
-    const target = WAITLIST_TIMING_FLOOR_MS + waitlistTimingJitterMs();
-    if (elapsed < target) await sleep(target - elapsed);
-    return respond(response);
-  };
-
-  const nowMs = now().getTime();
-  const emailHash = sha256(normalized);
-  try {
-    if (await store.pendingExists(emailHash, nowMs)) {
-      await dispatcher.sendSignInLink(normalized, emailHash, nowMs);
-    }
-  } catch {
-    // Swallowed on purpose. Whether a send was attempted, and whether it
-    // succeeded, are both statements about membership; surfacing either as a
-    // distinct status would rebuild the oracle the uniform response exists to
-    // close. Nothing is promoted here either way -- promotion requires a
-    // verified token, which only a real delivery can produce.
-  }
-  return await settle(apiJson({ ok: true }, request, config, { status: 202 }));
+    request,
+    config,
+    { headers: { "Cache-Control": "no-store" }, status: 200 },
+  );
+  return request.method === "HEAD" ? withoutBody(response) : response;
 }
 
-// Exchange: turning a mailed link into a proved address.
-//
-// The link lands here with the entry's hash (placed there at dispatch) and the
-// oobCode Identity Platform generated. The oobCode is exchanged for an ID
-// token, the token is verified independently, and only an address that survives
-// both is promoted.
-//
-// The exchange is keyless. `accounts:signInWithEmailLink` declares OAuth2
-// `cloud-platform` in the Identity Toolkit discovery document, so a short-lived
-// service-account bearer token is enough and no Firebase API key -- public or
-// server-held -- exists anywhere in this flow.
-//
-// Every failure returns the same bytes and the same status. That is what keeps
-// `h` from being probeable: without it, an attacker could submit the hash of an
-// address they are curious about with a junk oobCode and tell "no such entry"
-// apart from "wrong code". Success is allowed to differ, because reaching it
-// requires an oobCode that only the mailbox ever held.
 async function handleWaitlistConfirm(
   request: Request,
   url: URL,
@@ -589,12 +563,14 @@ async function handleWaitlistConfirm(
   store: WaitlistStore,
   quota: WaitlistQuota,
   rateLimiter: InMemoryRateLimiter,
-  dispatcher: { exchangeSignInLink: IdentityPlatformClient["exchangeSignInLink"] } | undefined,
-  verifier: { verify: IdentityTokenVerifier["verify"] } | undefined,
+  dispatcher: { verifyEmailLink: IdentityPlatformClient["verifyEmailLink"] } | undefined,
+  codec: Pick<
+    WaitlistConfirmationCodec,
+    "openBrowserProof" | "openLink" | "sealBrowserProof"
+  > | undefined,
+  recaptcha: Pick<RecaptchaEnterpriseClient, "assess"> | undefined,
   identitySecrets: readonly Uint8Array[],
   now: () => Date,
-  sleep: (ms: number) => Promise<void>,
-  monotonicNow: () => number,
 ): Promise<Response> {
   if (request.method === "OPTIONS") {
     return withSecurityHeaders(
@@ -607,211 +583,244 @@ async function handleWaitlistConfirm(
       status: 405,
     });
   }
-  if (dispatcher === undefined || verifier === undefined || !config.waitlistActivationEnabled) {
+  if (
+    !config.waitlistActivationEnabled ||
+    dispatcher === undefined ||
+    codec === undefined ||
+    recaptcha === undefined
+  ) {
     return apiJson({ error: "waitlist verification is not available" }, request, config, {
       status: 503,
     });
   }
 
-  const client = resolveWaitlistClient(request, identitySecrets);
-  const respond = (response: Response): Response =>
-    withWaitlistClientCookie(response, client.setCookie);
+  const nowMs = now().getTime();
+  if (request.method === "GET") {
+    // A mail scanner may follow this GET. It must never consume the code or
+    // mutate waitlist state. The only effect is a short-lived, HttpOnly cookie
+    // in that user agent, followed by a redirect that strips credentials from
+    // the address bar and browser history.
+    const linkState = url.searchParams.get("state") ?? "";
+    const oobCode = url.searchParams.get("oobCode") ?? "";
+    try {
+      const proof = await codec.sealBrowserProof(linkState, oobCode, nowMs);
+      return withSecurityHeaders(new Response(null, {
+        headers: {
+          "Cache-Control": "no-store",
+          Location: "/waitlist/confirm",
+          "Referrer-Policy": "no-referrer",
+          "Set-Cookie": confirmationCookie(proof, 10 * 60),
+        },
+        status: 303,
+      }));
+    } catch {
+      return withSecurityHeaders(new Response(null, {
+        headers: {
+          "Cache-Control": "no-store",
+          Location: "/waitlist/confirm?result=invalid",
+          "Referrer-Policy": "no-referrer",
+          "Set-Cookie": clearConfirmationCookie(),
+        },
+        status: 303,
+      }));
+    }
+  }
 
+  const expectedOrigin = new URL(request.url).origin;
+  if (request.headers.get("origin") !== expectedOrigin) {
+    return apiJson({ error: "forbidden" }, request, config, {
+      headers: { "Set-Cookie": clearConfirmationCookie() },
+      status: 403,
+    });
+  }
+  const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim()
+    .toLowerCase();
+  if (contentType !== "application/json") {
+    return apiJson({ error: "expected application/json" }, request, config, {
+      headers: { "Set-Cookie": clearConfirmationCookie() },
+      status: 415,
+    });
+  }
+  const parsed = await readBoundedJson(request, MAX_WAITLIST_BODY_SIZE);
+  if (parsed.kind !== "ok") {
+    return apiJson({ error: "invalid JSON body" }, request, config, {
+      headers: { "Set-Cookie": clearConfirmationCookie() },
+      status: parsed.kind === "too-large" ? 413 : 400,
+    });
+  }
+  const recaptchaToken = (parsed.value as { recaptchaToken?: unknown } | undefined)?.recaptchaToken;
+  if (typeof recaptchaToken !== "string") {
+    return apiJson({ error: "verification is required" }, request, config, {
+      headers: { "Set-Cookie": clearConfirmationCookie() },
+      status: 400,
+    });
+  }
+
+  const proofCookie = cookieValue(request.headers.get("cookie"), CONFIRMATION_COOKIE);
+  const refuse = (status = 400): Response =>
+    apiJson({ error: "verification link is invalid or has expired" }, request, config, {
+      headers: { "Cache-Control": "no-store", "Set-Cookie": clearConfirmationCookie() },
+      status,
+    });
+  if (proofCookie === undefined) return refuse();
+
+  // Authenticate the server-minted browser proof before spending any shared
+  // assessment or provider quota. An attacker with no mailbox-delivered link
+  // can exercise bounded local cryptography, but cannot drain the budget that
+  // legitimate confirmations need.
+  let proof: { readonly linkState: string; readonly oobCode: string };
+  let state: { readonly email: string };
+  try {
+    proof = await codec.openBrowserProof(proofCookie, nowMs);
+    state = await codec.openLink(proof.linkState, nowMs);
+  } catch {
+    return refuse();
+  }
+
+  const client = resolveWaitlistClient(request, identitySecrets);
   const local = rateLimiter.checkMany([
-    { key: `waitlist:client:${client.id}`, limit: WAITLIST_QUOTA_LIMITS.client.limit, windowMs: 60_000 },
-    { key: "waitlist:global", limit: WAITLIST_QUOTA_LIMITS.global.limit, windowMs: 60_000 },
+    {
+      key: `waitlist:assessment-client:${client.id}`,
+      limit: WAITLIST_QUOTA_LIMITS.client.limit,
+      windowMs: 60_000,
+    },
+    {
+      key: "waitlist:assessment-global",
+      limit: WAITLIST_QUOTA_LIMITS.assessmentGlobal.limit,
+      windowMs: 60_000,
+    },
   ]);
   if (!local.allowed) {
-    const response = rateLimitedWaitlistResponse(request, config, local.retryAfterSeconds);
-    return client.authenticated ? respond(response) : response;
-  }
-
-  const emailHash = url.searchParams.get("h") ?? "";
-  const oobCode = url.searchParams.get("oobCode") ?? "";
-
-  const quotaRules: QuotaRule[] = [
-    {
-      key: "waitlist:global",
-      limit: WAITLIST_QUOTA_LIMITS.global.limit,
-      windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
-    },
-    client.authenticated
-      ? {
-        key: `waitlist:client:${client.id.toLowerCase()}`,
-        limit: WAITLIST_QUOTA_LIMITS.client.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
-      }
-      : {
-        key: "waitlist:unestablished",
-        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
-      },
-  ];
-  let decision;
-  try {
-    decision = await quota.consume(quotaRules, now());
-  } catch {
-    return respond(apiJson({ error: "service unavailable" }, request, config, { status: 503 }));
-  }
-  if (!decision.allowed) {
-    const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
-    return client.authenticated ? respond(response) : response;
-  }
-
-  const startedAt = monotonicNow();
-  const settle = async (response: Response): Promise<Response> => {
-    const elapsed = monotonicNow() - startedAt;
-    const target = WAITLIST_TIMING_FLOOR_MS + waitlistTimingJitterMs();
-    if (elapsed < target) await sleep(target - elapsed);
-    return respond(response);
-  };
-  // One refusal, used for every way this can fail.
-  const refuse = () =>
-    settle(
-      apiJson({ error: "verification link is invalid or has expired" }, request, config, {
-        status: 400,
-      }),
-    );
-
-  // Shape-checked before anything is looked up, so a malformed parameter costs
-  // no work and is indistinguishable from a well-formed one that misses.
-  if (!/^[0-9a-f]{64}$/.test(emailHash)) return await refuse();
-  if (oobCode.length === 0 || oobCode.length > MAX_OOB_CODE_LENGTH) return await refuse();
-  if (!/^[A-Za-z0-9._~-]+$/.test(oobCode)) return await refuse();
-
-  const nowMs = now().getTime();
-  try {
-    const email = await store.emailFor(emailHash, nowMs);
-    if (email === undefined) return await refuse();
-
-    const idToken = await dispatcher.exchangeSignInLink(email, oobCode, nowMs);
-    // Verified independently of the exchange. The exchange proves Identity
-    // Platform accepted the code; the verifier proves the token is genuinely
-    // this project's, carries a verified address, and was authenticated
-    // recently enough to promote on.
-    const identity = await verifier.verify(idToken, nowMs);
-    // And the address it proves must be the one this link was issued for.
-    if (sha256(identity.email) !== emailHash) return await refuse();
-
-    const outcome = await store.confirm(emailHash, identity.subject, nowMs);
-    if (outcome !== "confirmed" && outcome !== "already-confirmed") {
-      return await refuse();
-    }
-    // A replayed link reports the same thing as the first use. The promotion
-    // itself is single-use; saying so twice is not.
-    return await settle(apiJson({ ok: true, status: "confirmed" }, request, config, { status: 200 }));
-  } catch {
-    // Exchange rejected, token unverifiable, store unreachable -- all the same
-    // answer. Distinguishing them here is what would make `h` probeable.
-    return await refuse();
-  }
-}
-
-// Activation: the second half of the ownership flow.
-//
-// It accepts a token and nothing else. There is no browser API key anywhere in
-// this design, so there is no client-callable Identity Platform surface to
-// bypass the quota with -- the only way to reach a mailbox is through the
-// backend dispatch, behind the same shared budget.
-async function handleWaitlistActivation(
-  request: Request,
-  config: RuntimeConfig,
-  store: WaitlistStore,
-  quota: WaitlistQuota,
-  verifier: { verify: IdentityTokenVerifier["verify"] } | undefined,
-  identitySecrets: readonly Uint8Array[],
-  now: () => Date,
-): Promise<Response> {
-  if (request.method === "OPTIONS") {
-    return withSecurityHeaders(
-      new Response(null, { headers: corsHeaders(request, config), status: 204 }),
-    );
-  }
-  if (request.method !== "POST") {
-    return apiJson({ error: "method not allowed" }, request, config, {
-      headers: { Allow: "POST, OPTIONS" },
-      status: 405,
-    });
-  }
-  if (verifier === undefined || !config.waitlistActivationEnabled) {
-    // Fail closed twice over. No audience means no token can be trusted; and
-    // even with one configured, promotion stays unreachable until the mailed
-    // oobCode exchange has been proved end to end against the live service.
-    return apiJson({ error: "waitlist activation is not available" }, request, config, {
-      status: 503,
+    return apiJson({ error: "too many verification attempts" }, request, config, {
+      headers: { "Retry-After": String(local.retryAfterSeconds) },
+      status: 429,
     });
   }
 
-  const client = resolveWaitlistClient(request, identitySecrets);
-  // Activation spends the shared budget too. Otherwise it would be an
-  // unmetered oracle for guessing tokens.
+  // Assessment spend and Identity Platform verification spend are separate.
+  // Invalid bot tokens cannot consume the smaller provider budget.
   let decision;
   try {
     decision = await quota.consume([
       {
-        key: "waitlist:global",
-        limit: WAITLIST_QUOTA_LIMITS.global.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+        key: "waitlist:assessment-global",
+        limit: WAITLIST_QUOTA_LIMITS.assessmentGlobal.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.assessmentGlobal.windowSeconds,
       },
       client.authenticated
         ? {
-          key: `waitlist:client:${client.id.toLowerCase()}`,
+          key: `waitlist:assessment-client:${client.id.toLowerCase()}`,
           limit: WAITLIST_QUOTA_LIMITS.client.limit,
           windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
         }
         : {
-          key: "waitlist:unestablished",
+          key: "waitlist:assessment-unestablished",
           limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
           windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
         },
     ], now());
-  } catch (error) {
-    console.error("waitlist quota unavailable", error instanceof Error ? error.name : "unknown");
-    return apiJson({ error: "waitlist temporarily unavailable" }, request, config, {
+  } catch {
+    return apiJson({ error: "verification temporarily unavailable" }, request, config, {
       headers: { "Retry-After": "60" },
       status: 503,
     });
   }
   if (!decision.allowed) {
-    return rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
+    return apiJson({ error: "too many verification attempts" }, request, config, {
+      headers: { "Retry-After": String(decision.retryAfterSeconds) },
+      status: 429,
+    });
   }
 
-  const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim()
-    .toLowerCase();
-  if (contentType !== "application/json") {
-    return apiJson({ error: "expected application/json" }, request, config, { status: 415 });
-  }
-  const parsed = await readBoundedJson(request, MAX_WAITLIST_BODY_SIZE);
-  if (parsed.kind === "too-large") {
-    return apiJson({ error: "request body too large" }, request, config, { status: 413 });
-  }
-  if (parsed.kind !== "ok") {
-    return apiJson({ error: "invalid JSON body" }, request, config, { status: 400 });
-  }
-  const body = parsed.value as { idToken?: unknown } | undefined;
-  if (!body || typeof body.idToken !== "string") {
-    return apiJson({ error: "idToken is required" }, request, config, { status: 400 });
-  }
-
-  const nowMs = now().getTime();
-  let identity;
   try {
-    identity = await verifier.verify(body.idToken, nowMs);
-  } catch {
-    // Deliberately uniform: which check refused the token is not the caller's
-    // business, and naming it would help an attacker shape the next one.
-    return apiJson({ error: "activation could not be verified" }, request, config, { status: 401 });
+    await recaptcha.assess(
+      recaptchaToken,
+      WAITLIST_CONFIRM_ACTION,
+      nowMs,
+      request.headers.get("user-agent") ?? undefined,
+    );
+  } catch (error) {
+    console.error("waitlist confirmation attestation refused", error instanceof Error ? error.name : "unknown error");
+    // The encrypted proof remains in its short-lived HttpOnly cookie so a
+    // transient assessment failure does not destroy a valid mailed link.
+    return apiJson({ error: "verification could not be completed" }, request, config, {
+      status: 403,
+    });
   }
 
-  const outcome = await store.confirm(sha256(identity.email), identity.subject, nowMs);
-  if (outcome === "absent" || outcome === "expired") {
-    // Same answer for both: whether an address was ever submitted, and whether
-    // its pending window lapsed, are membership facts.
-    return apiJson({ error: "activation could not be verified" }, request, config, { status: 401 });
+  try {
+    decision = await quota.consume([
+      {
+        key: "waitlist:confirm-global",
+        limit: WAITLIST_QUOTA_LIMITS.global.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
+      },
+      client.authenticated
+        ? {
+          key: `waitlist:confirm-client:${client.id.toLowerCase()}`,
+          limit: WAITLIST_QUOTA_LIMITS.client.limit,
+          windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+        }
+        : {
+          key: "waitlist:confirm-unestablished",
+          limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
+          windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
+        },
+    ], now());
+  } catch {
+    return apiJson({ error: "verification temporarily unavailable" }, request, config, {
+      headers: { "Retry-After": "60" },
+      status: 503,
+    });
   }
-  // "confirmed" and "already-confirmed" are the same to a caller: a replayed
-  // token must not be distinguishable from a first use.
-  return apiJson({ ok: true }, request, config, { status: 200 });
+  if (!decision.allowed) {
+    return apiJson({ error: "too many verification attempts" }, request, config, {
+      headers: { "Retry-After": String(decision.retryAfterSeconds) },
+      status: 429,
+    });
+  }
+
+  try {
+    // Verify the OOB code before touching membership state. A caller without a
+    // mailbox-delivered code can never choose a hash and time a database hit.
+    const verifiedEmail = normalizeEmail(await dispatcher.verifyEmailLink(proof.oobCode, nowMs));
+    if (verifiedEmail !== state.email) return refuse();
+
+    const outcome = await store.confirm(
+      sha256(verifiedEmail),
+      sha256(`identity-platform-email-link:${verifiedEmail}`),
+      nowMs,
+    );
+    if (outcome !== "confirmed" && outcome !== "already-confirmed") return refuse();
+    return apiJson({ ok: true, status: "confirmed" }, request, config, {
+      headers: { "Cache-Control": "no-store", "Set-Cookie": clearConfirmationCookie() },
+      status: 200,
+    });
+  } catch (error) {
+    console.error("waitlist confirmation refused", error instanceof Error ? error.name : "unknown error");
+    return refuse();
+  }
+}
+
+function confirmationCookie(value: string, maxAgeSeconds: number): string {
+  return `${CONFIRMATION_COOKIE}=${value}; Path=/; Max-Age=${maxAgeSeconds}; Secure; HttpOnly; SameSite=Strict`;
+}
+
+function clearConfirmationCookie(): string {
+  return confirmationCookie("deleted", 0);
+}
+
+function cookieValue(header: string | null, name: string): string | undefined {
+  if (!header) return undefined;
+  for (const segment of header.split(";")) {
+    const position = segment.indexOf("=");
+    if (position < 1) continue;
+    if (segment.slice(0, position).trim() === name) {
+      const value = segment.slice(position + 1).trim();
+      return value || undefined;
+    }
+  }
+  return undefined;
 }
 
 function withWaitlistClientCookie(response: Response, setCookie: string | undefined): Response {
@@ -862,31 +871,68 @@ async function serveStatic(pathname: string, config: RuntimeConfig, headOnly = f
   const requestedPath = pathnameWithoutSlash === "favicon.ico" ? "favicon.svg" : pathnameWithoutSlash;
   const normalizedPath = normalize(requestedPath);
 
-  if (normalizedPath.startsWith("..") || normalizedPath.includes("/../")) {
+  if (
+    isAbsolute(normalizedPath) ||
+    normalizedPath === ".." ||
+    normalizedPath.startsWith(`..${sep}`) ||
+    normalizedPath.includes(`${sep}..${sep}`)
+  ) {
     return text("not found", { status: 404 });
   }
 
-  let filePath = join(config.publicDir, normalizedPath);
-  let file = Bun.file(filePath);
-
-  if (!(await file.exists()) && config.publicDir !== BUILT_PUBLIC_DIR) {
-    filePath = join(BUILT_PUBLIC_DIR, normalizedPath);
-    file = Bun.file(filePath);
+  const resolved = await resolveStaticFile(config.publicDir, normalizedPath) ??
+    (config.publicDir === BUILT_PUBLIC_DIR
+      ? undefined
+      : await resolveStaticFile(BUILT_PUBLIC_DIR, normalizedPath));
+  if (resolved === undefined) {
+    return text("not found", { status: 404 });
   }
-
-  if (!(await file.exists())) {
+  const file = Bun.file(resolved.path);
+  // Touch Bun's own size metadata before wrapping its body in the common
+  // security-header response. Without this, Bun treats the body as a generic
+  // stream and may discard Content-Length in favour of chunked transfer.
+  const fileSize = file.size;
+  if (fileSize !== resolved.size) {
     return text("not found", { status: 404 });
   }
 
   return withSecurityHeaders(
     new Response(headOnly ? null : file, {
       headers: {
-        "Cache-Control": normalizedPath === "index.html" || normalizedPath === "scan.html" ? "no-cache" : "public, max-age=300",
-        "Content-Length": String(file.size),
-        "Content-Type": CONTENT_TYPES[extname(filePath)] ?? "application/octet-stream",
+        "Cache-Control": normalizedPath === "waitlist-confirm.html"
+          ? "no-store"
+          : normalizedPath === "index.html" || normalizedPath === "scan.html"
+          ? "no-cache"
+          : "public, max-age=300",
+        ...(normalizedPath === "waitlist-confirm.html" ? { "Referrer-Policy": "no-referrer" } : {}),
+        "Content-Length": String(fileSize),
+        "Content-Type": CONTENT_TYPES[extname(resolved.path)] ?? "application/octet-stream",
       },
     }),
   );
+}
+
+async function resolveStaticFile(
+  root: string,
+  normalizedPath: string,
+): Promise<{ readonly path: string; readonly size: number } | undefined> {
+  try {
+    const realRoot = await realpath(root);
+    const candidate = await realpath(join(realRoot, normalizedPath));
+    const withinRoot = relative(realRoot, candidate);
+    if (
+      withinRoot === "" ||
+      isAbsolute(withinRoot) ||
+      withinRoot === ".." ||
+      withinRoot.startsWith(`..${sep}`)
+    ) {
+      return undefined;
+    }
+    const metadata = await stat(candidate);
+    return metadata.isFile() ? { path: candidate, size: metadata.size } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function withoutBody(response: Response): Response {

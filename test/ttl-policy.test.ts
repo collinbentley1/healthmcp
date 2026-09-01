@@ -117,11 +117,12 @@ describe("expiresAt is stored as a timestamp everywhere it is written", () => {
       status: "pending",
       userAgentHash: "u".repeat(64),
     });
-    const written = JSON.parse(bodies.at(-1)!) as {
-      fields: Record<string, Record<string, string>>;
+    const committed = JSON.parse(bodies.at(-1)!) as {
+      writes: { update?: { fields?: Record<string, Record<string, string>> } }[];
     };
-    expect(written.fields[TTL_FIELD]).toEqual({ timestampValue: "2026-10-01T12:00:00.000Z" });
-    expect(written.fields[TTL_FIELD]?.stringValue).toBeUndefined();
+    const written = committed.writes[0]?.update?.fields ?? {};
+    expect(written[TTL_FIELD]).toEqual({ timestampValue: "2026-10-01T12:00:00.000Z" });
+    expect(written[TTL_FIELD]?.stringValue).toBeUndefined();
   });
 
   test("a quota bucket writes expiresAt as timestampValue", async () => {

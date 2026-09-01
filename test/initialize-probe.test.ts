@@ -240,6 +240,45 @@ describe("initialize probe", () => {
     expect(config.waitlistIdentitySecrets[0]?.byteLength).toBe(32);
   });
 
+  test("binds the Identity Platform return URL to the exact canonical confirmation endpoint", () => {
+    const activeKey = Buffer.alloc(32, 41).toString("base64url");
+    const activation = {
+      IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085",
+      RECAPTCHA_PROJECT_ID: "medlock-1025243085",
+      RECAPTCHA_SITE_KEY: "public_site_key_12345678901234567890",
+      WAITLIST_ACTIVATION_ENABLED: "true",
+      WAITLIST_BACKEND: "firestore",
+      WAITLIST_IDENTITY_KEYSET: activeKey,
+    };
+    expect(() =>
+      getRuntimeConfig({
+        ...activation,
+        CANONICAL_HOST: "medlock.ai/attacker",
+        IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm",
+      })
+    ).toThrow("CANONICAL_HOST");
+    for (const returnUrl of [
+      "https://attacker.example/api/waitlist/confirm",
+      "https://medlock.ai/other",
+      "https://medlock.ai:444/api/waitlist/confirm",
+    ]) {
+      expect(() =>
+        getRuntimeConfig({
+          ...activation,
+          CANONICAL_HOST: "medlock.ai",
+          IDENTITY_PLATFORM_CONTINUE_URL: returnUrl,
+        })
+      ).toThrow("canonical /api/waitlist/confirm");
+    }
+    expect(
+      getRuntimeConfig({
+        ...activation,
+        CANONICAL_HOST: "MEDLOCK.AI",
+        IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm",
+      }).identityPlatformContinueUrl,
+    ).toBe("https://medlock.ai/api/waitlist/confirm");
+  });
+
   test("rejects JSON-RPC batches and oversized MCP bodies", async () => {
     const endpoint = serve();
     const batch = await fetch(endpoint, {

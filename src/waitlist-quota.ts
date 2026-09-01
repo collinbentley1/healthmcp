@@ -84,6 +84,9 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
     this.#client = options.client;
     this.#collection = options.collection;
     this.#deadlineMs = options.deadlineMs ?? MAX_QUOTA_WALL_CLOCK_MS;
+    if (!Number.isSafeInteger(this.#deadlineMs) || this.#deadlineMs < 1) {
+      throw new Error("Firestore waitlist quota requires a positive integer deadline");
+    }
     // Monotonic: a wall clock that steps backwards would extend the budget.
     this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
   }
@@ -122,16 +125,24 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
     // can observe from outside.
     const names = rules.map((rule) => this.#documentName(rule.key, windowIndex(nowMs, rule.windowSeconds)));
     const startedAt = this.#monotonicNow();
+    // One signal spans metadata-token acquisition, transaction start, every
+    // read, every retry, and the final commit. Checking a clock only between
+    // attempts does not bound a first fetch that never returns.
+    const deadline = AbortSignal.timeout(this.#deadlineMs);
     for (let attempt = 1; attempt <= MAX_QUOTA_TRANSACTION_ATTEMPTS; attempt += 1) {
       // Checked before each attempt, including the first, so a caller that is
       // already out of budget never opens a transaction it cannot finish.
       if (attempt > 1 && this.#monotonicNow() - startedAt >= this.#deadlineMs) {
         throw new Error("Firestore waitlist quota exceeded its decision deadline");
       }
-      const transaction = await this.#client.beginTransaction();
+      if (deadline.aborted) {
+        throw new Error("Firestore waitlist quota exceeded its decision deadline");
+      }
+      let transaction: string | undefined;
       let decided: QuotaDecision | undefined;
       try {
-        const documents = await this.#client.batchGet(names, transaction);
+        transaction = await this.#client.beginTransaction(deadline);
+        const documents = await this.#client.batchGet(names, transaction, deadline);
         let allowed = true;
         let retryAfterSeconds = 0;
         rules.forEach((rule, position) => {
@@ -179,7 +190,7 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
               delete: this.#documentName(rule.key, windowIndex(nowMs, rule.windowSeconds) - 2),
             });
           }
-          const outcome = await this.#client.commitTransaction(transaction, writes);
+          const outcome = await this.#client.commitTransaction(transaction, writes, deadline);
           if (outcome.committed) {
             // The counters actually moved. Judge the authoritative post-
             // increment values rather than the pre-read ones.
@@ -194,11 +205,21 @@ export class FirestoreWaitlistQuota implements WaitlistQuota {
           continue;
         }
       } catch (error) {
-        await this.#client.rollback(transaction);
+        // Cleanup has its own short bound: once the decision deadline has
+        // fired, reusing its already-aborted signal would skip rollback, while
+        // an unbounded rollback would reintroduce the latency bug here.
+        if (transaction !== undefined) {
+          await this.#client.rollback(transaction, AbortSignal.timeout(500)).catch(() => undefined);
+        }
+        if (deadline.aborted) {
+          throw new Error("Firestore waitlist quota exceeded its decision deadline", {
+            cause: error,
+          });
+        }
         throw error;
       }
       // A refusal writes nothing at all, which is the entire point.
-      await this.#client.rollback(transaction);
+      await this.#client.rollback(transaction, deadline);
       return decided;
     }
     // Retries exhausted under sustained contention. Fail closed: an instance
