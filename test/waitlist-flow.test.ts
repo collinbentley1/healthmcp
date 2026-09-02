@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { getRuntimeConfig } from "../src/config.ts";
 import { createHandler } from "../src/server.ts";
 import { WaitlistConfirmationCodec } from "../src/waitlist-confirmation.ts";
+import { MemoryWaitlistQuota, type WaitlistQuota } from "../src/waitlist-quota.ts";
 import { MemoryWaitlistStore, sha256, submitWaitlist } from "../src/waitlist.ts";
 
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
@@ -24,7 +25,7 @@ const CONFIG = {
 
 type HarnessOptions = {
   readonly assess?: (token: string, action: string) => Promise<unknown>;
-  readonly quota?: { consume: (rules: readonly { key: string }[]) => Promise<{ allowed: boolean; retryAfterSeconds: number }> };
+  readonly quota?: WaitlistQuota;
   readonly send?: (email: string, linkState: string) => Promise<void>;
   readonly store?: MemoryWaitlistStore;
   readonly verify?: (oobCode: string) => Promise<string>;
@@ -161,6 +162,35 @@ describe("waitlist double opt-in submission", () => {
     expect(calls[0]).not.toContain("waitlist:global");
   });
 
+  test("five anonymous invalid tokens cannot lock a different address out of joining", async () => {
+    const quota = new MemoryWaitlistQuota();
+    const { handler } = harness({
+      assess: async (token) => {
+        if (token.startsWith("invalid-")) throw new Error("invalid");
+      },
+      quota,
+    });
+    for (let index = 0; index < 5; index += 1) {
+      expect((await handler(join(`attacker-${index}@example.com`, `invalid-${index}`))).status).toBe(403);
+    }
+    expect((await handler(join("legitimate@example.com", "valid"))).status).toBe(202);
+  });
+
+  test("anonymous assessment limits isolate one submitted address", async () => {
+    const quota = new MemoryWaitlistQuota();
+    const { handler } = harness({
+      assess: async () => {
+        throw new Error("invalid");
+      },
+      quota,
+    });
+    for (let index = 0; index < 5; index += 1) {
+      expect((await handler(join("target@example.com", `invalid-${index}`))).status).toBe(403);
+    }
+    expect((await handler(join("target@example.com", "invalid-spill"))).status).toBe(429);
+    expect((await handler(join("independent@example.com", "invalid-independent"))).status).toBe(403);
+  });
+
   test("provider failure fails closed without membership detail", async () => {
     const { handler } = harness({
       send: async () => {
@@ -252,6 +282,35 @@ describe("explicit confirmation", () => {
     expect(state.quotaCalls[0]).toContain("waitlist:assessment-global");
     expect(state.quotaCalls[0]).not.toContain("waitlist:confirm-global");
     expect(response.headers.get("set-cookie")).toBeNull();
+  });
+
+  test("five anonymous invalid joins cannot lock a fresh browser out of confirming", async () => {
+    const quota = new MemoryWaitlistQuota();
+    const store = new MemoryWaitlistStore();
+    await submitWaitlist(store, { clientId: "seed", email: "member@example.com" }, new Date(NOW));
+    const state = harness({
+      assess: async (_token, action) => {
+        if (action === "waitlist_join") throw new Error("invalid");
+      },
+      quota,
+      store,
+    });
+    for (let index = 0; index < 5; index += 1) {
+      expect(
+        (await state.handler(join(`attacker-${index}@example.com`, `invalid-${index}`))).status,
+      ).toBe(403);
+    }
+
+    const linkState = await state.codec.sealLink("member@example.com", NOW);
+    const get = await state.handler(
+      new Request(
+        `http://localhost/api/waitlist/confirm?state=${encodeURIComponent(linkState)}&oobCode=oob-code_1`,
+      ),
+    );
+    const cookie = (get.headers.get("set-cookie") ?? "").split(";", 1)[0]!;
+    const response = await state.handler(confirm(cookie));
+    expect(response.status).toBe(200);
+    expect(state.store.peek(sha256("member@example.com"))?.status).toBe("confirmed");
   });
 
   test("a valid code for another address cannot promote the stored claim", async () => {

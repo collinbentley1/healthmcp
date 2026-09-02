@@ -341,7 +341,7 @@ describe("server", () => {
     }
   });
 
-  test("caps cookie-discarding callers before they can rotate through the global budget", async () => {
+  test("does not let cookie-discarding callers create a shared five-request choke point", async () => {
     const identitySecret = new Uint8Array(32).fill(9);
     const handler = createHandler({
       config: waitlistConfig,
@@ -354,13 +354,9 @@ describe("server", () => {
         method: "POST",
       });
 
-    for (let index = 0; index < 5; index += 1) {
+    for (let index = 0; index < 6; index += 1) {
       expect((await handler(request(index))).status).toBe(202);
     }
-    const rejected = await handler(request(5));
-    expect(rejected.status).toBe(429);
-    expect(rejected.headers.get("set-cookie")).toBeNull();
-    expect((await handler(request(6))).status).toBe(429);
   });
 
   test("caps aggregate waitlist traffic across authenticated client cookies", async () => {

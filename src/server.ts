@@ -77,19 +77,20 @@ function waitlistTimingJitterMs(): number {
   return (draw[0]! / 2 ** 32) * WAITLIST_TIMING_JITTER_MS;
 }
 
-// The authoritative buckets. `unestablished` is what makes cookie minting
-// pointless: discarding a cookie to get a fresh client id moves the request
-// into a bucket that is shared by everyone doing the same thing.
-// The three original budgets are unchanged; moving them to Firestore is the
-// fix, not relaxing them. `email` is new: it bounds how often one address can
-// be submitted, which is what stops the endpoint being used to send repeated
-// confirmation mail to someone who never asked for it.
+// The authoritative buckets. There is deliberately no low shared
+// "unestablished client" bucket: one anonymous caller could fill it with
+// invalid tokens and deny every new browser. Before attestation, a high global
+// cost ceiling is combined with independently scoped address and signed-client
+// buckets. After attestation, the global delivery ceiling, address budget, and
+// signed-client bucket bound mail. A caller can discard its cookie, but doing so
+// neither creates a shared five-request choke point nor escapes the global and
+// per-address bounds.
 export const WAITLIST_QUOTA_LIMITS = {
   assessmentGlobal: { limit: 120, windowSeconds: 60 },
+  assessmentSubject: { limit: 5, windowSeconds: 60 },
   client: { limit: 5, windowSeconds: 60 },
   email: { limit: 2, windowSeconds: 86_400 },
   global: { limit: 60, windowSeconds: 60 },
-  unestablished: { limit: 5, windowSeconds: 60 },
 } as const;
 const WAITLIST_JOIN_ACTION = "waitlist_join";
 const WAITLIST_CONFIRM_ACTION = "waitlist_confirm";
@@ -318,6 +319,7 @@ async function handleWaitlist(
 
   const client = resolveWaitlistClient(request, identitySecrets);
   const respond = (response: Response): Response => withWaitlistClientCookie(response, client.setCookie);
+  const clientQuotaSubject = sha256(client.id).slice(0, 32);
 
   // Defence in depth, not the limit. This sheds an obvious flood before the
   // request costs a network round trip, but it is per-instance and so can never
@@ -330,17 +332,10 @@ async function handleWaitlist(
       windowMs: 60_000,
     },
   ];
-  if (!client.authenticated) {
-    localRules.unshift({
-      key: "waitlist:unestablished",
-      limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-      windowMs: 60_000,
-    });
-  }
   const local = rateLimiter.checkMany(localRules);
   if (!local.allowed) {
     const response = rateLimitedWaitlistResponse(request, config, local.retryAfterSeconds);
-    return client.authenticated ? respond(response) : response;
+    return respond(response);
   }
 
   const contentType = (request.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase();
@@ -369,6 +364,7 @@ async function handleWaitlist(
   if (!isValidEmail(normalizedEmail)) {
     return respond(apiJson({ error: "Enter a valid email address." }, request, config, { status: 400 }));
   }
+  const addressQuotaSubject = sha256(normalizedEmail).slice(0, 32);
 
   // First bound assessment cost globally. These are distinct from the mail
   // budgets below, so a flood of invalid attestation tokens cannot exhaust the
@@ -379,20 +375,17 @@ async function handleWaitlist(
       limit: WAITLIST_QUOTA_LIMITS.assessmentGlobal.limit,
       windowSeconds: WAITLIST_QUOTA_LIMITS.assessmentGlobal.windowSeconds,
     },
+    {
+      key: `waitlist:assessment-address:${addressQuotaSubject}`,
+      limit: WAITLIST_QUOTA_LIMITS.assessmentSubject.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.assessmentSubject.windowSeconds,
+    },
+    {
+      key: `waitlist:assessment-client:${clientQuotaSubject}`,
+      limit: WAITLIST_QUOTA_LIMITS.client.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+    },
   ];
-  assessmentRules.push(
-    client.authenticated
-      ? {
-        key: `waitlist:assessment-client:${client.id.toLowerCase()}`,
-        limit: WAITLIST_QUOTA_LIMITS.client.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
-      }
-      : {
-        key: "waitlist:assessment-unestablished",
-        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
-      },
-  );
 
   let decision;
   try {
@@ -411,7 +404,7 @@ async function handleWaitlist(
   }
   if (!decision.allowed) {
     const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
-    return client.authenticated ? respond(response) : response;
+    return respond(response);
   }
 
   const observedAt = now();
@@ -437,21 +430,15 @@ async function handleWaitlist(
       windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
     },
     {
-      key: `waitlist:email:${sha256(normalizedEmail).slice(0, 32)}`,
+      key: `waitlist:email:${addressQuotaSubject}`,
       limit: WAITLIST_QUOTA_LIMITS.email.limit,
       windowSeconds: WAITLIST_QUOTA_LIMITS.email.windowSeconds,
     },
-    client.authenticated
-      ? {
-        key: `waitlist:client:${client.id.toLowerCase()}`,
-        limit: WAITLIST_QUOTA_LIMITS.client.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
-      }
-      : {
-        key: "waitlist:unestablished",
-        limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-        windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
-      },
+    {
+      key: `waitlist:client:${clientQuotaSubject}`,
+      limit: WAITLIST_QUOTA_LIMITS.client.limit,
+      windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+    },
   ];
   try {
     decision = await quota.consume(deliveryRules, observedAt);
@@ -676,6 +663,11 @@ async function handleWaitlistConfirm(
   } catch {
     return refuse();
   }
+  // This scope comes from the authenticated mailed proof, not from caller
+  // input or a discardable browser cookie. One mailbox/link can therefore
+  // consume only its own allowance and can never fill a shared gate used by
+  // other people confirming their addresses.
+  const confirmationQuotaSubject = sha256(state.email).slice(0, 32);
 
   const client = resolveWaitlistClient(request, identitySecrets);
   const local = rateLimiter.checkMany([
@@ -707,17 +699,11 @@ async function handleWaitlistConfirm(
         limit: WAITLIST_QUOTA_LIMITS.assessmentGlobal.limit,
         windowSeconds: WAITLIST_QUOTA_LIMITS.assessmentGlobal.windowSeconds,
       },
-      client.authenticated
-        ? {
-          key: `waitlist:assessment-client:${client.id.toLowerCase()}`,
-          limit: WAITLIST_QUOTA_LIMITS.client.limit,
-          windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
-        }
-        : {
-          key: "waitlist:assessment-unestablished",
-          limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-          windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
-        },
+      {
+        key: `waitlist:assessment-confirmation:${confirmationQuotaSubject}`,
+        limit: WAITLIST_QUOTA_LIMITS.assessmentSubject.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.assessmentSubject.windowSeconds,
+      },
     ], now());
   } catch {
     return apiJson({ error: "verification temporarily unavailable" }, request, config, {
@@ -755,17 +741,11 @@ async function handleWaitlistConfirm(
         limit: WAITLIST_QUOTA_LIMITS.global.limit,
         windowSeconds: WAITLIST_QUOTA_LIMITS.global.windowSeconds,
       },
-      client.authenticated
-        ? {
-          key: `waitlist:confirm-client:${client.id.toLowerCase()}`,
-          limit: WAITLIST_QUOTA_LIMITS.client.limit,
-          windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
-        }
-        : {
-          key: "waitlist:confirm-unestablished",
-          limit: WAITLIST_QUOTA_LIMITS.unestablished.limit,
-          windowSeconds: WAITLIST_QUOTA_LIMITS.unestablished.windowSeconds,
-        },
+      {
+        key: `waitlist:confirm-subject:${confirmationQuotaSubject}`,
+        limit: WAITLIST_QUOTA_LIMITS.client.limit,
+        windowSeconds: WAITLIST_QUOTA_LIMITS.client.windowSeconds,
+      },
     ], now());
   } catch {
     return apiJson({ error: "verification temporarily unavailable" }, request, config, {
