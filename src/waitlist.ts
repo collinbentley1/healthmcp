@@ -2,22 +2,51 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { RuntimeConfig } from "./config.ts";
+import { FirestoreClient, type FirestoreDocument, type FirestoreValue, readString } from "./firestore.ts";
+
+export type { FetchLike } from "./firestore.ts";
+
+// A submission is a claim, not a membership. It stays `pending` until the
+// address is proven to belong to whoever typed it, and it expires on its own if
+// that proof never arrives, so an unverified claim can never quietly age into
+// something the product treats as a subscriber.
+export type WaitlistStatus = "pending" | "confirmed";
 
 export type WaitlistEntry = {
   readonly clientHash: string;
+  readonly confirmedAt: string | null;
   readonly createdAt: string;
   readonly email: string;
   readonly emailHash: string;
+  readonly expiresAt: string;
+  readonly confirmedSubject: string | null;
   readonly source: string;
+  readonly status: WaitlistStatus;
   readonly userAgentHash: string;
 };
 
-export type WaitlistStore = {
-  get(emailHash: string): Promise<WaitlistEntry | undefined>;
-  put(entry: WaitlistEntry): Promise<void>;
-};
+// The only creation verb the store exposes. There is deliberately no public
+// read-by-email: a lookup that answers "is this address here?" is the
+// enumeration oracle itself, and removing it removes the oracle rather than
+// papering over it. The 409/EEXIST that distinguishes the two cases is decided
+// by the storage engine in one round trip, so there is no window between the
+// check and the write for a concurrent request to slip through.
+export type WaitlistCreateOutcome = "created" | "duplicate" | "refreshed";
 
-export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+export type WaitlistConfirmOutcome = "confirmed" | "already-confirmed" | "absent" | "expired";
+
+export type WaitlistStore = {
+  create(entry: WaitlistEntry): Promise<WaitlistCreateOutcome>;
+  // Promotes exactly one pending entry to confirmed, or reports why it could
+  // not. The transition is single-use: a second call with the same proof gets
+  // "already-confirmed", never a second promotion, so a replayed token cannot
+  // reset an entry's state or extend its life.
+  confirm(
+    emailHash: string,
+    subject: string,
+    nowMs: number,
+  ): Promise<WaitlistConfirmOutcome>;
+};
 
 export type WaitlistSubmission = {
   readonly clientId: string;
@@ -27,46 +56,195 @@ export type WaitlistSubmission = {
 };
 
 export type WaitlistResult =
-  | { readonly ok: true; readonly duplicate: boolean; readonly entry: WaitlistEntry }
+  | { readonly ok: true; readonly outcome: WaitlistCreateOutcome }
   | { readonly ok: false; readonly error: string; readonly status: number };
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const PENDING_TTL_SECONDS = 30 * 24 * 60 * 60;
+// Far enough out that the TTL policy never reaps a confirmed member, while
+// leaving the field present so the policy still has something to read.
+// Bounded so a hostile racer cannot hold a request open indefinitely.
+const MAX_CONFIRM_ATTEMPTS = 5;
+const MAX_PREPARE_ATTEMPTS = 5;
 
-export async function submitWaitlist(store: WaitlistStore, submission: WaitlistSubmission, now = new Date()): Promise<WaitlistResult> {
+const CONFIRMED_EXPIRES_AT = "9999-12-31T23:59:59.000Z";
+
+export async function submitWaitlist(
+  store: WaitlistStore,
+  submission: WaitlistSubmission,
+  now = new Date(),
+): Promise<WaitlistResult> {
   const email = normalizeEmail(submission.email);
 
   if (!isValidEmail(email)) {
     return { ok: false, error: "Enter a valid email address.", status: 400 };
   }
 
-  const emailHash = sha256(email);
-  const existing = await store.get(emailHash);
-  if (existing) {
-    return { ok: true, duplicate: true, entry: existing };
-  }
-
   const entry: WaitlistEntry = {
     clientHash: sha256(submission.clientId || "unknown"),
+    confirmedAt: null,
+    confirmedSubject: null,
     createdAt: now.toISOString(),
     email,
-    emailHash,
+    emailHash: sha256(email),
+    expiresAt: new Date(now.getTime() + PENDING_TTL_SECONDS * 1_000).toISOString(),
     source: sanitizeSource(submission.source),
+    status: "pending",
     userAgentHash: sha256(submission.userAgent || "unknown"),
   };
 
-  await store.put(entry);
-  return { ok: true, duplicate: false, entry };
+  // The outcome never leaves this process. The deployed Firestore backend uses
+  // the same read/write transaction shape for every membership state and also
+  // replaces an expired pending claim before a new confirmation link is sent.
+  return { ok: true, outcome: await store.create(entry) };
+}
+
+// One strict validator for every persisted record, used by every path that is
+// about to act on one.
+//
+// The failure this closes is subtle and fails OPEN: an expiry check written as
+// `Date.parse(entry.expiresAt) <= nowMs` is FALSE when the parse yields NaN, so
+// a record with a missing, empty, or corrupt expiry was treated as unexpired
+// and promoted. A legacy row, a partial write, or a hand-edited document was
+// therefore a path to confirmation. Nothing here coerces: a record that is not
+// internally consistent is refused, and the caller mutates nothing.
+export function waitlistEntryFromUnknown(
+  value: unknown,
+  expectedEmailHash: string,
+): WaitlistEntry {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("waitlist record is not an object");
+  }
+  const source = value as Record<string, unknown>;
+  const text = (field: string, max = 512): string => {
+    const raw = source[field];
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > max) {
+      throw new Error(`waitlist record field ${field} is malformed`);
+    }
+    return raw;
+  };
+  const instant = (field: string): string => {
+    const raw = text(field, 64);
+    const parsed = Date.parse(raw);
+    // Canonical, and above all FINITE: an unparseable timestamp must not become
+    // a comparison that silently succeeds.
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== raw) {
+      throw new Error(`waitlist record field ${field} is not a canonical instant`);
+    }
+    return raw;
+  };
+  const nullableText = (field: string, max = 512): string | null => {
+    const raw = source[field];
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > max) {
+      throw new Error(`waitlist record field ${field} is malformed`);
+    }
+    return raw;
+  };
+
+  const status = source.status;
+  if (status !== "pending" && status !== "confirmed") {
+    // Never coerce an unknown state to pending: an unrecognised status is a
+    // record this code does not understand, not a claim awaiting confirmation.
+    throw new Error("waitlist record status is not a recognised state");
+  }
+
+  const email = text("email", 254);
+  if (email !== normalizeEmail(email)) {
+    throw new Error("waitlist record email is not normalised");
+  }
+  const emailHash = text("emailHash", 64);
+  // The record must be about the address it claims, and must be the record the
+  // caller asked for. Either mismatch means the document identity and its
+  // contents disagree, and acting on it would confirm somebody else's address.
+  if (emailHash !== sha256(email)) {
+    throw new Error("waitlist record hash does not match its email");
+  }
+  if (emailHash !== expectedEmailHash) {
+    throw new Error("waitlist record does not belong to the requested address");
+  }
+
+  const confirmedAt = nullableText("confirmedAt", 64);
+  const confirmedSubject = nullableText("confirmedSubject", 128);
+  if (status === "pending" && (confirmedAt !== null || confirmedSubject !== null)) {
+    throw new Error("waitlist record is pending but carries confirmation fields");
+  }
+  if (status === "confirmed" && (confirmedAt === null || confirmedSubject === null)) {
+    throw new Error("waitlist record is confirmed but carries no confirmation");
+  }
+  if (confirmedAt !== null) instant("confirmedAt");
+
+  return {
+    clientHash: text("clientHash", 64),
+    confirmedAt,
+    confirmedSubject,
+    createdAt: instant("createdAt"),
+    email,
+    emailHash,
+    expiresAt: instant("expiresAt"),
+    source: text("source", 60),
+    status,
+    userAgentHash: text("userAgentHash", 64),
+  };
 }
 
 export class MemoryWaitlistStore implements WaitlistStore {
   readonly #entries = new Map<string, WaitlistEntry>();
 
-  async get(emailHash: string): Promise<WaitlistEntry | undefined> {
+  async create(entry: WaitlistEntry): Promise<WaitlistCreateOutcome> {
+    const existing = this.#entries.get(entry.emailHash);
+    if (existing === undefined) {
+      this.#entries.set(entry.emailHash, entry);
+      return "created";
+    }
+    const stored = waitlistEntryFromUnknown(existing, entry.emailHash);
+    if (
+      stored.status === "pending" &&
+      Date.parse(stored.expiresAt) <= Date.parse(entry.createdAt)
+    ) {
+      this.#entries.set(entry.emailHash, entry);
+      return "refreshed";
+    }
+    // A Map#set is intentionally still performed: all in-memory states take one
+    // read and one write operation, matching the deployed transaction's fixed
+    // shape rather than making membership observable through work performed.
+    this.#entries.set(entry.emailHash, stored);
+    return "duplicate";
+  }
+
+  async confirm(
+    emailHash: string,
+    subject: string,
+    nowMs: number,
+  ): Promise<WaitlistConfirmOutcome> {
+    const stored = this.#entries.get(emailHash);
+    if (stored === undefined) return "absent";
+    // Validated before it is acted on, so a corrupt expiry cannot become a
+    // comparison that quietly succeeds.
+    const entry = waitlistEntryFromUnknown(stored, emailHash);
+    if (entry.status === "confirmed") return "already-confirmed";
+    if (Date.parse(entry.expiresAt) <= nowMs) return "expired";
+    this.#entries.set(emailHash, {
+      ...entry,
+      confirmedAt: new Date(nowMs).toISOString(),
+      confirmedSubject: subject,
+      // Confirmation clears the expiry: a verified member is not a claim that
+      // ages out. The TTL policy only reaps documents whose expiresAt is in the
+      // past, so a far-future value keeps a confirmed entry indefinitely while
+      // leaving the field present for the policy to read.
+      expiresAt: CONFIRMED_EXPIRES_AT,
+      status: "confirmed",
+    });
+    return "confirmed";
+  }
+
+  // Test-only inspection. Never reachable from a request path.
+  peek(emailHash: string): WaitlistEntry | undefined {
     return this.#entries.get(emailHash);
   }
 
-  async put(entry: WaitlistEntry): Promise<void> {
-    this.#entries.set(entry.emailHash, entry);
+  get size(): number {
+    return this.#entries.size;
   }
 }
 
@@ -77,29 +255,44 @@ export class FileWaitlistStore implements WaitlistStore {
     this.#directory = directory;
   }
 
-  async get(emailHash: string): Promise<WaitlistEntry | undefined> {
-    const filePath = this.#filePath(emailHash);
+  async create(entry: WaitlistEntry): Promise<WaitlistCreateOutcome> {
+    const filePath = this.#filePath(entry.emailHash);
+    await mkdir(dirname(filePath), { recursive: true });
     try {
-      const entry = JSON.parse(await readFile(filePath, "utf8")) as WaitlistEntry & {
-        readonly ipHash?: string;
-      };
-      return {
-        ...entry,
-        clientHash: entry.clientHash || entry.ipHash || "",
-      };
+      // `wx` is the atomic half of this: the kernel decides, not a prior read.
+      await writeFile(filePath, `${JSON.stringify(entry, null, 2)}\n`, { flag: "wx" });
+      return "created";
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return undefined;
+      if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
+        return "duplicate";
       }
-
       throw error;
     }
   }
 
-  async put(entry: WaitlistEntry): Promise<void> {
-    const filePath = this.#filePath(entry.emailHash);
-    await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, `${JSON.stringify(entry, null, 2)}\n`, { flag: "wx" });
+  // Deliberately unsupported.
+  //
+  // A durable single-use transition needs a compare-and-swap, and this backend
+  // has none: read-then-write lets two concurrent confirmations both succeed,
+  // with the second subject overwriting the first. That would contradict the
+  // interface, so rather than offer a promotion that is only single-use when
+  // nobody races it, this refuses. Deployed services are required to run the
+  // Firestore backend, which does have one.
+  async confirm(): Promise<WaitlistConfirmOutcome> {
+    throw new Error(
+      "The file waitlist backend has no compare-and-swap and cannot confirm ownership; use WAITLIST_BACKEND=firestore.",
+    );
+  }
+
+  async read(emailHash: string): Promise<WaitlistEntry | undefined> {
+    try {
+      return JSON.parse(await readFile(this.#filePath(emailHash), "utf8")) as WaitlistEntry;
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    }
   }
 
   #filePath(emailHash: string): string {
@@ -108,95 +301,185 @@ export class FileWaitlistStore implements WaitlistStore {
 }
 
 export class FirestoreWaitlistStore implements WaitlistStore {
+  readonly #client: FirestoreClient;
   readonly #collection: string;
-  readonly #databaseId: string;
-  readonly #fetch: FetchLike;
-  readonly #projectId: string;
-  #token: { readonly accessToken: string; readonly expiresAt: number } | undefined;
+  readonly #deadlineMs: number;
+  readonly #monotonicNow: () => number;
 
-  constructor(options: { collection: string; databaseId: string; fetcher?: FetchLike; projectId: string }) {
+  constructor(options: {
+    client: FirestoreClient;
+    collection: string;
+    deadlineMs?: number;
+    monotonicNow?: () => number;
+  }) {
+    this.#client = options.client;
     this.#collection = options.collection;
-    this.#databaseId = options.databaseId;
-    this.#fetch = options.fetcher ?? fetch;
-    this.#projectId = options.projectId;
-  }
-
-  async get(emailHash: string): Promise<WaitlistEntry | undefined> {
-    const response = await this.#fetch(this.#documentUrl(emailHash), {
-      headers: await this.#headers(),
-    });
-
-    if (response.status === 404) {
-      return undefined;
-    }
-
-    if (!response.ok) {
-      throw new Error(`Firestore waitlist read failed: ${response.status}`);
-    }
-
-    return fromFirestoreDocument(await response.json());
-  }
-
-  async put(entry: WaitlistEntry): Promise<void> {
-    const response = await this.#fetch(this.#collectionUrl(entry.emailHash), {
-      body: JSON.stringify(toFirestoreDocument(entry)),
-      headers: {
-        ...(await this.#headers()),
-        "Content-Type": "application/json; charset=utf-8",
-      },
-      method: "POST",
-    });
-
-    if (response.status === 409) {
-      return;
-    }
-
-    if (!response.ok) {
-      throw new Error(`Firestore waitlist write failed: ${response.status}`);
+    this.#deadlineMs = options.deadlineMs ?? 5_000;
+    this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
+    if (!Number.isSafeInteger(this.#deadlineMs) || this.#deadlineMs < 1) {
+      throw new Error("Firestore waitlist deadline must be a positive integer");
     }
   }
 
-  async #headers(): Promise<Record<string, string>> {
-    const accessToken = await this.#accessToken();
-    return { Authorization: `Bearer ${accessToken}` };
-  }
-
-  async #accessToken(): Promise<string> {
-    const now = Date.now();
-    if (this.#token && this.#token.expiresAt > now + 60_000) {
-      return this.#token.accessToken;
+  async create(entry: WaitlistEntry): Promise<WaitlistCreateOutcome> {
+    const name = this.#client.documentName(this.#collection, entry.emailHash);
+    const startedAt = this.#monotonicNow();
+    const deadline = AbortSignal.timeout(this.#deadlineMs);
+    for (let attempt = 1; attempt <= MAX_PREPARE_ATTEMPTS; attempt += 1) {
+      if (
+        deadline.aborted ||
+        (attempt > 1 && this.#monotonicNow() - startedAt >= this.#deadlineMs)
+      ) {
+        throw new Error("Firestore waitlist preparation exceeded its deadline");
+      }
+      let transaction: string | undefined;
+      try {
+        transaction = await this.#client.beginTransaction(deadline);
+        const document = (await this.#client.batchGet([name], transaction, deadline)).get(name);
+        let outcome: WaitlistCreateOutcome;
+        let write: unknown;
+        if (document === undefined) {
+          outcome = "created";
+          write = {
+            currentDocument: { exists: false },
+            update: toFirestoreDocument(entry, name),
+          };
+        } else {
+          const baseVersion = document.updateTime;
+          if (typeof baseVersion !== "string" || baseVersion.length === 0) {
+            throw new Error("Firestore waitlist entry has no version to compare against");
+          }
+          const stored = waitlistEntryFromUnknown(fromFirestoreDocument(document), entry.emailHash);
+          if (
+            stored.status === "pending" &&
+            Date.parse(stored.expiresAt) <= Date.parse(entry.createdAt)
+          ) {
+            outcome = "refreshed";
+            write = {
+              currentDocument: { updateTime: baseVersion },
+              update: toFirestoreDocument(entry, name),
+            };
+          } else {
+            outcome = "duplicate";
+            // Firestore's verify write changes no fields, but preserves the same
+            // begin/read/commit shape as create and refresh. That keeps the
+            // membership state from changing the number of network round trips.
+            write = {
+              currentDocument: { updateTime: baseVersion },
+              verify: name,
+            };
+          }
+        }
+        const committed = await this.#client.commitTransaction(transaction, [write], deadline);
+        if (committed.committed) return outcome;
+        // The read set moved. Begin a fresh transaction and re-judge it.
+        continue;
+      } catch (error) {
+        if (transaction !== undefined) {
+          await this.#client.rollback(transaction, AbortSignal.timeout(500)).catch(() => undefined);
+        }
+        if (deadline.aborted) {
+          throw new Error("Firestore waitlist preparation exceeded its deadline", { cause: error });
+        }
+        throw error;
+      }
     }
+    throw new Error("Firestore waitlist preparation could not commit");
+  }
 
-    const response = await this.#fetch("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", {
-      headers: { "Metadata-Flavor": "Google" },
-    });
-
-    if (!response.ok) {
-      throw new Error(`metadata token request failed: ${response.status}`);
+  // Single-use, enforced by a per-document compare-and-swap.
+  //
+  // This deliberately does NOT rely on transaction isolation. Isolation is a
+  // cross-document guarantee that this service cannot observe from outside,
+  // and a promotion is the one operation where being wrong hands somebody
+  // else's account away. Instead the entry is read, and the promotion carries
+  // the exact `updateTime` that read observed as a write precondition. If
+  // anything touched the entry in between -- a second confirmation, a racing
+  // subject, an administrative edit -- the stored version no longer matches
+  // the required base version and Firestore refuses the write outright.
+  //
+  // Verified against the Firestore emulator: replaying a stale updateTime is
+  // refused with FAILED_PRECONDITION and the document keeps its first value,
+  // so the first confirmation wins and the second cannot clobber its subject.
+  async confirm(
+    emailHash: string,
+    subject: string,
+    nowMs: number,
+  ): Promise<WaitlistConfirmOutcome> {
+    const name = this.#client.documentName(this.#collection, emailHash);
+    const startedAt = this.#monotonicNow();
+    // One deadline spans token acquisition, every read, every conditional
+    // commit, and all retries. A hung first call must not inherit Cloud Run's
+    // much larger request timeout.
+    const deadline = AbortSignal.timeout(this.#deadlineMs);
+    for (let attempt = 1; attempt <= MAX_CONFIRM_ATTEMPTS; attempt += 1) {
+      if (
+        deadline.aborted ||
+        (attempt > 1 && this.#monotonicNow() - startedAt >= this.#deadlineMs)
+      ) {
+        throw new Error("Firestore waitlist confirmation exceeded its deadline");
+      }
+      try {
+        const document = await this.#client.get(this.#collection, emailHash, deadline);
+        if (document === undefined) {
+          return "absent";
+        }
+        // A document with no version cannot be swapped safely, and promoting it
+        // unconditionally is exactly the read-then-blind-write this replaced.
+        const baseVersion = document.updateTime;
+        if (typeof baseVersion !== "string" || baseVersion.length === 0) {
+          throw new Error("Firestore waitlist entry has no version to compare against");
+        }
+        const entry = waitlistEntryFromUnknown(fromFirestoreDocument(document), emailHash);
+        if (entry.status === "confirmed") {
+          return "already-confirmed";
+        }
+        if (Date.parse(entry.expiresAt) <= nowMs) {
+          return "expired";
+        }
+        const outcome = await this.#client.commitConditional([{
+          currentDocument: { updateTime: baseVersion },
+          update: toFirestoreDocument({
+            ...entry,
+            confirmedAt: new Date(nowMs).toISOString(),
+            confirmedSubject: subject,
+            expiresAt: CONFIRMED_EXPIRES_AT,
+            status: "confirmed",
+          }, name),
+          updateMask: {
+            fieldPaths: ["confirmedAt", "confirmedSubject", "expiresAt", "status"],
+          },
+        }], deadline);
+        if (outcome === "committed") {
+          return "confirmed";
+        }
+        // The entry moved. Re-read and re-judge; the next pass observes whatever
+        // the winner wrote, which is how a second confirmation reports
+        // "already-confirmed" rather than promoting twice.
+      } catch (error) {
+        if (deadline.aborted) {
+          throw new Error("Firestore waitlist confirmation exceeded its deadline", {
+            cause: error,
+          });
+        }
+        throw error;
+      }
     }
-
-    const token = (await response.json()) as { access_token: string; expires_in: number };
-    this.#token = {
-      accessToken: token.access_token,
-      expiresAt: now + token.expires_in * 1000,
-    };
-    return token.access_token;
+    // Never guess at membership state.
+    throw new Error("Firestore waitlist confirmation could not commit");
   }
 
-  #documentUrl(emailHash: string): string {
-    return `${this.#documentsBaseUrl()}/${encodePathSegment(this.#collection)}/${encodePathSegment(emailHash)}`;
-  }
-
-  #collectionUrl(emailHash: string): string {
-    return `${this.#documentsBaseUrl()}/${encodePathSegment(this.#collection)}?documentId=${encodeURIComponent(emailHash)}`;
-  }
-
-  #documentsBaseUrl(): string {
-    return `https://firestore.googleapis.com/v1/projects/${this.#projectId}/databases/${encodePathSegment(this.#databaseId)}/documents`;
+  async read(emailHash: string): Promise<WaitlistEntry | undefined> {
+    const document = await this.#client.get(
+      this.#collection,
+      emailHash,
+      AbortSignal.timeout(this.#deadlineMs),
+    );
+    return document ? fromFirestoreDocument(document) : undefined;
   }
 }
 
-export function createWaitlistStore(config: RuntimeConfig): WaitlistStore {
+export function createWaitlistStore(config: RuntimeConfig, client?: FirestoreClient): WaitlistStore {
   if (config.waitlistBackend === "memory") {
     return new MemoryWaitlistStore();
   }
@@ -207,9 +490,12 @@ export function createWaitlistStore(config: RuntimeConfig): WaitlistStore {
     }
 
     return new FirestoreWaitlistStore({
+      client: client ??
+        new FirestoreClient({
+          databaseId: config.firestoreDatabaseId,
+          projectId: config.firestoreProjectId,
+        }),
       collection: config.firestoreCollection,
-      databaseId: config.firestoreDatabaseId,
-      projectId: config.firestoreProjectId,
     });
   }
 
@@ -224,7 +510,7 @@ export function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
 }
 
-function isValidEmail(email: string): boolean {
+export function isValidEmail(email: string): boolean {
   return email.length >= 3 && email.length <= 254 && EMAIL_PATTERN.test(email);
 }
 
@@ -233,57 +519,44 @@ function sanitizeSource(value: string | undefined): string {
   return source.replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 60) || "site";
 }
 
-type FirestoreDocument = {
-  readonly fields?: Record<string, FirestoreValue>;
-};
-
-type FirestoreValue =
-  | { readonly integerValue: string }
-  | { readonly stringValue: string }
-  | { readonly timestampValue: string };
-
-function toFirestoreDocument(entry: WaitlistEntry): FirestoreDocument {
-  return {
-    fields: {
-      createdAt: { timestampValue: entry.createdAt },
-      clientHash: { stringValue: entry.clientHash },
-      email: { stringValue: entry.email },
-      emailHash: { stringValue: entry.emailHash },
-      source: { stringValue: entry.source },
-      userAgentHash: { stringValue: entry.userAgentHash },
-    },
+function toFirestoreDocument(entry: WaitlistEntry, name?: string): FirestoreDocument {
+  const fields: Record<string, FirestoreValue> = {
+    clientHash: { stringValue: entry.clientHash },
+    createdAt: { timestampValue: entry.createdAt },
+    email: { stringValue: entry.email },
+    emailHash: { stringValue: entry.emailHash },
+    expiresAt: { timestampValue: entry.expiresAt },
+    source: { stringValue: entry.source },
+    status: { stringValue: entry.status },
+    userAgentHash: { stringValue: entry.userAgentHash },
   };
+  if (entry.confirmedAt !== null) {
+    fields.confirmedAt = { timestampValue: entry.confirmedAt };
+  }
+  if (entry.confirmedSubject !== null) {
+    fields.confirmedSubject = { stringValue: entry.confirmedSubject };
+  }
+  return name === undefined ? { fields } : { fields, name };
 }
 
 function fromFirestoreDocument(document: FirestoreDocument): WaitlistEntry {
   const fields = document.fields ?? {};
+  // Read faithfully. Mapping an unrecognised status to "pending" here would
+  // hand waitlistEntryFromUnknown a record that always validates, which is
+  // exactly the coercion that made a corrupt document promotable.
+  const status = readString(fields.status);
+  const confirmedAt = readString(fields.confirmedAt);
 
   return {
-    clientHash: readString(fields.clientHash) || readString(fields.ipHash),
+    clientHash: readString(fields.clientHash),
+    confirmedAt: confirmedAt || null,
+    confirmedSubject: readString(fields.confirmedSubject) || null,
     createdAt: readString(fields.createdAt),
     email: readString(fields.email),
     emailHash: readString(fields.emailHash),
+    expiresAt: readString(fields.expiresAt),
     source: readString(fields.source),
+    status: status as WaitlistStatus,
     userAgentHash: readString(fields.userAgentHash),
   };
-}
-
-function readString(value: FirestoreValue | undefined): string {
-  if (!value) {
-    return "";
-  }
-
-  if ("stringValue" in value) {
-    return value.stringValue;
-  }
-
-  if ("timestampValue" in value) {
-    return value.timestampValue;
-  }
-
-  return value.integerValue;
-}
-
-function encodePathSegment(segment: string): string {
-  return encodeURIComponent(segment).replaceAll("%28", "(").replaceAll("%29", ")");
 }

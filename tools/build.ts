@@ -9,9 +9,12 @@ await rm(distDir, { force: true, recursive: true });
 await mkdir(join(distPublicDir, "assets"), { recursive: true });
 
 const clientBuild = await Bun.build({
-  entrypoints: [join(import.meta.dir, "..", "src", "client.ts")],
+  entrypoints: [
+    join(import.meta.dir, "..", "src", "client.ts"),
+    join(import.meta.dir, "..", "src", "waitlist-confirm-client.ts"),
+  ],
   minify: true,
-  naming: "assets/client.js",
+  naming: "assets/[name].js",
   outdir: distPublicDir,
   sourcemap: "external",
   target: "browser",
@@ -31,6 +34,10 @@ assertBuild(serverBuild, "server");
 
 await Bun.write(join(distPublicDir, "index.html"), Bun.file(join(publicDir, "index.html")));
 await Bun.write(join(distPublicDir, "scan.html"), Bun.file(join(publicDir, "scan.html")));
+await Bun.write(
+  join(distPublicDir, "waitlist-confirm.html"),
+  Bun.file(join(publicDir, "waitlist-confirm.html")),
+);
 await Bun.write(join(distPublicDir, "favicon.svg"), Bun.file(join(publicDir, "favicon.svg")));
 await Bun.write(join(distPublicDir, "assets", "styles.css"), Bun.file(join(publicDir, "assets", "styles.css")));
 await Bun.write(join(distPublicDir, "assets", "og-image.png"), Bun.file(join(publicDir, "assets", "og-image.png")));

@@ -29,6 +29,35 @@ body {
   letter-spacing: 0;
 }
 
+.confirmation-page {
+  margin: 0 auto;
+  max-width: 760px;
+  padding: 80px 24px;
+}
+
+.confirmation-card {
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  box-shadow: var(--shadow);
+  padding: 48px;
+}
+
+.confirmation-card button {
+  background: var(--accent);
+  border: 0;
+  border-radius: 999px;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 14px 22px;
+}
+
+.confirmation-card button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 a {
   color: inherit;
   text-decoration: none;

@@ -10,6 +10,14 @@ export type RuntimeConfig = {
   readonly firestoreCollection: string;
   readonly firestoreDatabaseId: string;
   readonly firestoreProjectId: string | undefined;
+  // The Identity Platform project whose OAuth-only ownership calls this service
+  // makes. Unset means the flow is not provisioned, and activation refuses
+  // rather than guessing at a project.
+  readonly identityPlatformAudience: string | undefined;
+  readonly identityPlatformContinueUrl: string | undefined;
+  readonly recaptchaProjectId: string | undefined;
+  readonly recaptchaSiteKey: string | undefined;
+  readonly waitlistActivationEnabled: boolean;
   readonly legacyHosts: readonly string[];
   readonly mcpBearerToken: string | undefined;
   readonly port: number;
@@ -55,24 +63,73 @@ export function getRuntimeConfig(env: Record<string, string | undefined> = Bun.e
   const deploymentEnvironment = parseDeploymentEnvironment(env.PLATFORM_DEPLOY_ENVIRONMENT);
   const waitlistIdentitySecrets = parseWaitlistIdentitySecrets(env.WAITLIST_IDENTITY_KEYSET);
   const waitlistBackend = parseWaitlistBackend(env.WAITLIST_BACKEND);
+  const canonicalHost = parseCanonicalHost(env.CANONICAL_HOST);
+  const identityPlatformAudience = parseProjectId(
+    env.IDENTITY_PLATFORM_AUDIENCE,
+    "IDENTITY_PLATFORM_AUDIENCE",
+  );
+  const identityPlatformContinueUrl = parseContinueUrl(
+    env.IDENTITY_PLATFORM_CONTINUE_URL,
+    canonicalHost,
+  );
+  const recaptchaProjectId = parseProjectId(env.RECAPTCHA_PROJECT_ID, "RECAPTCHA_PROJECT_ID");
+  const recaptchaSiteKey = parseRecaptchaSiteKey(env.RECAPTCHA_SITE_KEY);
+  const waitlistActivationEnabled = parseActivationEnabled(env.WAITLIST_ACTIVATION_ENABLED);
   if ((deploymentEnvironment || waitlistBackend === "firestore") && waitlistIdentitySecrets.length === 0) {
     throw new Error("WAITLIST_IDENTITY_KEYSET is required for deployed services and the Firestore waitlist.");
+  }
+  // A deployed service runs many instances against shared state, and only the
+  // Firestore backend offers a durable compare-and-swap. The file backend would
+  // let two concurrent confirmations both succeed, so a deployment must say
+  // Firestore explicitly rather than inherit a local default.
+  if (deploymentEnvironment && waitlistBackend !== "firestore") {
+    throw new Error(
+      "A deployed service must set WAITLIST_BACKEND=firestore; no other backend has a durable compare-and-swap.",
+    );
+  }
+  if (
+    waitlistActivationEnabled &&
+    (
+      identityPlatformAudience === undefined ||
+      identityPlatformContinueUrl === undefined ||
+      recaptchaProjectId === undefined ||
+      recaptchaSiteKey === undefined
+    )
+  ) {
+    throw new Error(
+      "An enabled waitlist requires Identity Platform and reCAPTCHA Enterprise configuration.",
+    );
+  }
+  if (waitlistActivationEnabled && waitlistBackend !== "firestore") {
+    throw new Error("An enabled waitlist requires the Firestore compare-and-swap backend.");
+  }
+  if (
+    identityPlatformAudience !== undefined &&
+    recaptchaProjectId !== undefined &&
+    identityPlatformAudience !== recaptchaProjectId
+  ) {
+    throw new Error("Identity Platform and reCAPTCHA must use the same Google Cloud project.");
   }
 
   return {
     allowedHosts: parseList(env.ALLOWED_HOSTS, DEFAULT_ALLOWED_HOSTS),
     allowedOrigins: parseList(env.ALLOWED_ORIGINS, DEFAULT_ALLOWED_ORIGINS),
-    canonicalHost: env.CANONICAL_HOST ?? "medlock.ai",
+    canonicalHost,
     dataDir: env.DATA_DIR ?? join(import.meta.dir, "..", ".data"),
     deploymentEnvironment,
     firestoreCollection: env.FIRESTORE_COLLECTION ?? "waitlist",
     firestoreDatabaseId: env.FIRESTORE_DATABASE_ID ?? "(default)",
     firestoreProjectId: present(env.FIRESTORE_PROJECT_ID ?? env.GOOGLE_CLOUD_PROJECT),
+    identityPlatformAudience,
+    identityPlatformContinueUrl,
     legacyHosts: parseList(env.LEGACY_HOSTS, DEFAULT_LEGACY_HOSTS),
     mcpBearerToken: parseBearerToken(env.MEDLOCK_MCP_TOKEN),
     port: Number(env.PORT ?? 3000),
     publicDir: env.PUBLIC_DIR ?? (import.meta.dir.endsWith("/dist") ? BUILT_PUBLIC_DIR : SOURCE_PUBLIC_DIR),
+    recaptchaProjectId,
+    recaptchaSiteKey,
     version: env.MEDLOCK_VERSION ?? "0.2.0",
+    waitlistActivationEnabled,
     waitlistBackend,
     waitlistIdentitySecrets,
   };
@@ -164,6 +221,85 @@ function present(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+// Where the sign-in link lands. This is a redirect target that Identity
+// Platform will send to a mailbox, so it is validated rather than trusted: an
+// attacker-supplied continue URL would turn the ownership mail into an open
+// redirect carrying a single-use credential in its query string.
+// The ownership flow stays off until it has been proved end to end against the
+// live service.
+//
+// Every other piece can be verified locally, but the one thing that cannot is
+// whether a real mailed oobCode is accepted by the documented OAuth check-only
+// operation against the enabled API. Until that has been observed, promotion
+// must not be reachable in production -- so this defaults to off and has to be
+// turned on deliberately.
+// An unrecognised value is refused rather than read as off, because a silent
+// default is exactly how a flag meant to be temporary becomes permanent.
+function parseActivationEnabled(value: string | undefined): boolean {
+  const raw = present(value);
+  if (raw === undefined) return false;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new Error("WAITLIST_ACTIVATION_ENABLED must be exactly true or false.");
+}
+
+function parseCanonicalHost(value: string | undefined): string {
+  const host = (present(value) ?? "medlock.ai").toLowerCase();
+  if (
+    host.length > 253 ||
+    !/^[a-z0-9.-]+$/.test(host) ||
+    host.startsWith(".") ||
+    host.endsWith(".") ||
+    host.includes("..")
+  ) {
+    throw new Error("CANONICAL_HOST must be one DNS hostname without a port.");
+  }
+  return host;
+}
+
+function parseContinueUrl(value: string | undefined, canonicalHost: string): string | undefined {
+  const raw = present(value);
+  if (raw === undefined) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("IDENTITY_PLATFORM_CONTINUE_URL must be an absolute URL.");
+  }
+  if (url.protocol !== "https:") {
+    throw new Error("IDENTITY_PLATFORM_CONTINUE_URL must use https.");
+  }
+  // The oobCode arrives as a query parameter, so anything already carrying a
+  // query or fragment is refused rather than merged with.
+  if (url.search !== "" || url.hash !== "" || url.username !== "" || url.password !== "") {
+    throw new Error("IDENTITY_PLATFORM_CONTINUE_URL must not carry credentials, a query, or a fragment.");
+  }
+  if (url.hostname.toLowerCase() !== canonicalHost || url.port !== "" || url.pathname !== "/api/waitlist/confirm") {
+    throw new Error(
+      "IDENTITY_PLATFORM_CONTINUE_URL must be the canonical /api/waitlist/confirm endpoint.",
+    );
+  }
+  return url.toString();
+}
+
+function parseProjectId(value: string | undefined, name: string): string | undefined {
+  const projectId = present(value);
+  if (projectId === undefined) return undefined;
+  if (!/^[a-z][a-z0-9-]{4,29}$/.test(projectId)) {
+    throw new Error(`${name} must be a Google Cloud project id.`);
+  }
+  return projectId;
+}
+
+function parseRecaptchaSiteKey(value: string | undefined): string | undefined {
+  const key = present(value);
+  if (key === undefined) return undefined;
+  if (!/^[A-Za-z0-9_-]{20,100}$/.test(key)) {
+    throw new Error("RECAPTCHA_SITE_KEY must be a canonical public site key.");
+  }
+  return key;
+}
+
 function parseBearerToken(value: string | undefined): string | undefined {
   const token = present(value);
   if (token && new TextEncoder().encode(token).byteLength < 32) {
@@ -174,9 +310,11 @@ function parseBearerToken(value: string | undefined): string | undefined {
 }
 
 function parseWaitlistBackend(value: string | undefined): RuntimeConfig["waitlistBackend"] {
-  if (value === "firestore" || value === "memory") {
-    return value;
-  }
-
-  return "file";
+  // Unset means the local default. A value that is SET but unrecognised is a
+  // misconfiguration, and silently falling back to the file backend would
+  // quietly downgrade a deployment that meant to say "firestore" -- onto a
+  // backend with no compare-and-swap, where the ownership flow is unsafe.
+  if (value === undefined || value.trim() === "") return "file";
+  if (value === "firestore" || value === "memory" || value === "file") return value;
+  throw new Error("WAITLIST_BACKEND must be exactly firestore, memory, or file.");
 }

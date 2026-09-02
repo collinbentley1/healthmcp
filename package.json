@@ -20,7 +20,8 @@
     "format:check": "bun run tools/format.ts --check",
     "hooks:install": "git config core.hooksPath .githooks",
     "verify": "bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci",
-    "verify:ci": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build"
+    "verify:ci": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build",
+    "verify:ttl": "bun run tools/verify-ttl.ts"
   },
   "dependencies": {
     "@cfworker/json-schema": "4.1.1",

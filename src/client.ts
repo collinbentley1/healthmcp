@@ -1,3 +1,5 @@
+import { executeWaitlistRecaptcha } from "./recaptcha-browser.ts";
+
 const form = document.querySelector<HTMLFormElement>("[data-waitlist-form]");
 const emailInput = document.querySelector<HTMLInputElement>("[data-waitlist-email]");
 const statusText = document.querySelector<HTMLElement>("[data-waitlist-status]");
@@ -18,12 +20,14 @@ form?.addEventListener("submit", async (event) => {
   setStatus("Joining...", "pending");
 
   try {
+    const recaptchaToken = await executeWaitlistRecaptcha("join");
     const response = await fetch("/api/waitlist", {
-      body: JSON.stringify({ email, source: "site" }),
+      body: JSON.stringify({ email, recaptchaToken, source: "site" }),
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       method: "POST",
     });
-    const body = (await response.json()) as { duplicate?: boolean; error?: string; ok?: boolean };
+    const body = (await response.json()) as { error?: string; ok?: boolean };
 
     if (!response.ok) {
       setStatus(body.error ?? "Unable to join right now.", "error");
@@ -31,7 +35,11 @@ form?.addEventListener("submit", async (event) => {
     }
 
     emailInput.value = "";
-    setStatus(body.duplicate ? "You're already on the waitlist." : "You're on the list. We'll email you when beta opens.", "success");
+    // One message for every accepted address. The page used to say "You're
+    // already on the waitlist" for a known address and something else for a new
+    // one, which turned the form into a membership oracle that needed no API
+    // knowledge at all -- anyone could type an address and read the answer.
+    setStatus("Thanks. Check your inbox to confirm your address.", "success");
   } catch {
     setStatus("Unable to join right now.", "error");
   }

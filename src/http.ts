@@ -2,7 +2,7 @@ import { hostNameFromHeader, normalizeOrigin, type RuntimeConfig } from "./confi
 
 const SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "Content-Security-Policy":
-    "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'",
+    "default-src 'self'; base-uri 'none'; connect-src 'self' https://www.google.com/recaptcha/; form-action 'self'; frame-ancestors 'none'; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/; img-src 'self' data:; object-src 'none'; script-src 'self' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; style-src 'self'",
   "Cross-Origin-Opener-Policy": "same-origin",
   "Cross-Origin-Resource-Policy": "same-origin",
   "Permissions-Policy": "camera=(), geolocation=(), microphone=(), payment=()",
@@ -43,16 +43,13 @@ export function text(body: string, options: JsonResponseOptions = {}): Response 
 }
 
 export function withSecurityHeaders(response: Response): Response {
-  const headers = new Headers(response.headers);
   for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
-    headers.set(key, value);
+    if (!response.headers.has(key)) response.headers.set(key, value);
   }
-
-  return new Response(response.body, {
-    headers,
-    status: response.status,
-    statusText: response.statusText,
-  });
+  // Preserve native body types such as Bun.file. Re-wrapping response.body
+  // turns those into a generic stream, which loses their known length and can
+  // silently change HTTP framing from Content-Length to chunked transfer.
+  return response;
 }
 
 export function shouldRedirectToCanonical(request: Request, config: RuntimeConfig): URL | undefined {
