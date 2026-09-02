@@ -14,15 +14,6 @@ updates:
       # Third-party actions are still tracked normally.
       - dependency-name: "collinbentley1/platform/*"
 
-  - package-ecosystem: bun
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-      time: "09:05"
-      timezone: America/New_York
-    open-pull-requests-limit: 2
-
   - package-ecosystem: terraform
     directory: /infra/terraform/bootstrap
     schedule:

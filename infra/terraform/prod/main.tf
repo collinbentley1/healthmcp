@@ -1,5 +1,5 @@
 module "site" {
-  source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=9d6132795f01b90be532c807c672ed017588e18f"
+  source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=378116420ea2b48c5bb9dbb4cd42244a2f99c3db"
 
   providers = {
     google                = google
@@ -102,16 +102,6 @@ resource "google_firestore_field" "waitlist_quota_ttl" {
 # has already passed the shared quota and reCAPTCHA assessment. Dispatch stays
 # membership-independent so neither the response nor provider side effects form
 # an address-existence oracle.
-resource "google_project_service" "identity_toolkit" {
-  project = var.project_id
-  service = "identitytoolkit.googleapis.com"
-
-  # Disabling the API would break every outstanding sign-in link and lock out
-  # activation; that is a decision to take deliberately, not a side effect of
-  # destroying this resource.
-  disable_on_destroy = false
-}
-
 resource "google_identity_platform_config" "default" {
   project = var.project_id
 
@@ -134,8 +124,6 @@ resource "google_identity_platform_config" "default" {
     "medlock.ai",
     "www.medlock.ai",
   ]
-
-  depends_on = [google_project_service.identity_toolkit]
 }
 
 # Browser attestation is scored server-side with the runtime service account;
@@ -144,13 +132,6 @@ resource "google_identity_platform_config" "default" {
 # action, age, validity bit, and score in src/recaptcha.ts. Google implicitly
 # allows subdomains of an allowed apex, so the exact backend hostname check is the
 # narrower authorization boundary.
-resource "google_project_service" "recaptcha_enterprise" {
-  project = var.project_id
-  service = "recaptchaenterprise.googleapis.com"
-
-  disable_on_destroy = false
-}
-
 resource "google_recaptcha_enterprise_key" "waitlist" {
   project      = var.project_id
   display_name = "Medlock waitlist ownership"
@@ -166,6 +147,4 @@ resource "google_recaptcha_enterprise_key" "waitlist" {
     allow_amp_traffic = false
     allowed_domains   = ["medlock.ai"]
   }
-
-  depends_on = [google_project_service.recaptcha_enterprise]
 }

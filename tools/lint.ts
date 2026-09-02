@@ -237,8 +237,6 @@ for (const needle of [
 // of the trust boundary: score-key/domain settings at Google, exact project,
 // site-key, action, hostname, freshness, and score in the application.
 for (const needle of [
-  'resource "google_project_service" "recaptcha_enterprise"',
-  'service = "recaptchaenterprise.googleapis.com"',
   'resource "google_recaptcha_enterprise_key" "waitlist"',
   'deletion_policy = "PREVENT"',
   'integration_type  = "SCORE"',
