@@ -18,4 +18,4 @@ jobs:
       actions: read # Download only the exact prefetch artifact id the reusable workflow produces.
       id-token: write # Exchange only for the exact-SHA preview traffic operator.
       pull-requests: read # Compare live tags with authoritative pull-request heads.
-    uses: collinbentley1/platform/.github/workflows/reconcile-previews.yml@9d6132795f01b90be532c807c672ed017588e18f
+    uses: collinbentley1/platform/.github/workflows/reconcile-previews.yml@378116420ea2b48c5bb9dbb4cd42244a2f99c3db
