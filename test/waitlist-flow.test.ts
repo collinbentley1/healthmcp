@@ -187,7 +187,9 @@ describe("waitlist double opt-in submission", () => {
     for (let index = 0; index < 5; index += 1) {
       expect((await handler(join("target@example.com", `invalid-${index}`))).status).toBe(403);
     }
-    expect((await handler(join("target@example.com", "invalid-spill"))).status).toBe(429);
+    const denied = await handler(join("target@example.com", "invalid-spill"));
+    expect(denied.status).toBe(429);
+    expect(denied.headers.get("set-cookie")).toStartWith("medlock_waitlist_client=");
     expect((await handler(join("independent@example.com", "invalid-independent"))).status).toBe(403);
   });
 

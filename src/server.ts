@@ -451,7 +451,7 @@ async function handleWaitlist(
   }
   if (!decision.allowed) {
     const response = rateLimitedWaitlistResponse(request, config, decision.retryAfterSeconds);
-    return client.authenticated ? respond(response) : response;
+    return respond(response);
   }
 
   // From here to the response, every path costs the same wall time and returns
