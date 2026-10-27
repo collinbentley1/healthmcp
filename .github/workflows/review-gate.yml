@@ -1,0 +1,22 @@
+name: Automated review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  run:
+    name: Automated review
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    with:
+      platform_sha: 161b80ed362ce3c3c5bf177a1c2375b14b3e7266
+    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@161b80ed362ce3c3c5bf177a1c2375b14b3e7266
