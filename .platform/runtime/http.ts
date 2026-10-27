@@ -40,9 +40,13 @@ export async function readText(request: Pick<Request, "headers" | "body">, maxim
 }
 
 export function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
-  const response = Response.json(value, { status, headers: { "Cache-Control": "no-store", ...Object.fromEntries(new Headers(headers)) } });
-  response.headers.set("Content-Length", String(new TextEncoder().encode(JSON.stringify(value)).byteLength));
-  return response;
+  const body=JSON.stringify(value);
+  if(body===undefined)throw new TypeError("Value is not JSON serializable.");
+  const responseHeaders=new Headers(headers);
+  if(!responseHeaders.has("Content-Type"))responseHeaders.set("Content-Type","application/json");
+  if(!responseHeaders.has("Cache-Control"))responseHeaders.set("Cache-Control","no-store");
+  responseHeaders.set("Content-Length",String(new TextEncoder().encode(body).byteLength));
+  return new Response(body,{status,headers:responseHeaders});
 }
 
 export function requireOrigin(request: Request, origin: string): void {
