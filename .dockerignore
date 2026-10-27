@@ -15,3 +15,5 @@ coverage
 **/*.tfplan*
 **/*.pem
 **/*.key
+**/*.p12
+**/*.pfx

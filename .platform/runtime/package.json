@@ -6,5 +6,8 @@
     "./http": "./http.ts",
     "./auth": "./auth.ts",
     "./data": "./data.ts"
+  },
+  "dependencies": {
+    "jose": "6.1.3"
   }
 }

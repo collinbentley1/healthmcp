@@ -74,6 +74,13 @@ export class FirestoreClient {
     return { Authorization: `Bearer ${await this.#accessToken(signal)}` };
   }
 
+  async ready(collection: string): Promise<void> {
+    const signal=AbortSignal.timeout(8000);
+    const response=await this.#fetch(`${this.documentsBaseUrl}/${encodePathSegment(collection)}?pageSize=1&mask.fieldPaths=expiresAt`,{headers:await this.headers(signal),signal,redirect:"error"});
+    await response.body?.cancel();
+    if(!response.ok) throw new Error("Datastore unavailable.");
+  }
+
   async get(
     collection: string,
     documentId: string,
