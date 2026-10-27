@@ -1,3 +1,4 @@
+import { FirestoreClient } from "../src/firestore.ts";
 import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
@@ -585,3 +586,7 @@ function decodeChunkedBody(encoded: Buffer): Buffer {
 
   throw new Error("chunked HTTP response did not contain a terminating chunk");
 }
+
+test("readiness distinguishes datastore failure from process liveness",async()=>{const handler=createHandler({config,ready:async()=>{throw new Error("private datastore details");}});const live=await handler(new Request("http://localhost/livez"));expect(live.status).toBe(200);const ready=await handler(new Request("http://localhost/readyz"));expect(ready.status).toBe(503);expect(await ready.json()).toEqual({ok:false});});
+
+test("Firestore readiness rejects missing databases and denied access",async()=>{let status=404;const client=new FirestoreClient({projectId:"demo-project",databaseId:"(default)",fetcher:async(url)=>url.startsWith("http://metadata.")?Response.json({access_token:"synthetic",expires_in:3600}):Response.json({documents:[]},{status})});await expect(client.ready("waitlist")).rejects.toThrow("Datastore unavailable");status=403;await expect(client.ready("waitlist")).rejects.toThrow("Datastore unavailable");status=200;await expect(client.ready("waitlist")).resolves.toBeUndefined();});

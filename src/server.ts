@@ -38,6 +38,7 @@ import {
 
 type ServerDependencies = {
   readonly config?: RuntimeConfig;
+  readonly ready?: () => Promise<void>;
   readonly mcpEndpoint?: McpEndpoint;
   readonly now?: () => Date;
   readonly rateLimiter?: InMemoryRateLimiter;
@@ -179,6 +180,14 @@ function applicationHandler(dependencies: ServerDependencies = {}): (request: Re
         },
       });
       return request.method === "HEAD" ? withoutBody(response) : response;
+    }
+
+    if(healthUrl.pathname==="/readyz") {
+      if(request.method!=="GET" && request.method!=="HEAD") return text("method not allowed",{headers:{Allow:"GET, HEAD"},status:405});
+      let ok=true;
+      try {if(dependencies.ready) await dependencies.ready();else await firestoreClient?.ready(config.firestoreCollection);} catch {ok=false;}
+      const response=json({ok},{status:ok?200:503});
+      return request.method==="HEAD"?withoutBody(response):response;
     }
 
     if (!isTrustedHost(request, config)) {
