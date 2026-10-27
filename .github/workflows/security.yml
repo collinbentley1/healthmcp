@@ -15,4 +15,4 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: collinbentley1/platform/.github/workflows/security-v1.yml@8fa2b3880fbcb76b87125b364de1a140a739fe67
+    uses: collinbentley1/platform/.github/workflows/security-v1.yml@b5862f12d0e4cd96ed1452e1b83b6d4b9da72209

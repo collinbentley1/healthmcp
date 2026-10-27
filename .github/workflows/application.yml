@@ -20,5 +20,5 @@ jobs:
       pull-requests: read
     with:
       pull_request: ${{ inputs.pull_request || '' }}
-      platform_sha: 8fa2b3880fbcb76b87125b364de1a140a739fe67
-    uses: collinbentley1/platform/.github/workflows/application-v1.yml@8fa2b3880fbcb76b87125b364de1a140a739fe67
+      platform_sha: b5862f12d0e4cd96ed1452e1b83b6d4b9da72209
+    uses: collinbentley1/platform/.github/workflows/application-v1.yml@b5862f12d0e4cd96ed1452e1b83b6d4b9da72209
