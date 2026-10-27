@@ -18,5 +18,5 @@ jobs:
       pull-requests: read
       checks: write
     with:
-      platform_sha: 161b80ed362ce3c3c5bf177a1c2375b14b3e7266
-    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@161b80ed362ce3c3c5bf177a1c2375b14b3e7266
+      platform_sha: dc8d6c1a6f8c619ca9c19904d6448544324d8c6d
+    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@dc8d6c1a6f8c619ca9c19904d6448544324d8c6d

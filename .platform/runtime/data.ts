@@ -70,7 +70,7 @@ export function firestoreStore(project: string, collection = "platform_records",
   const call = async (url: string, init: RequestInit = {}) => boundedFetch(url, { ...init, headers: { "Content-Type": "application/json", ...Object.fromEntries(new Headers(init.headers)), Authorization: `Bearer ${await getToken()}` } });
   const decode = (doc: { name?: string; fields?: Record<string, { stringValue?: string }> }): RecordValue => {
     const id = doc.name?.split("/").at(-1); const title = doc.fields?.title?.stringValue; const createdAt = doc.fields?.createdAt?.stringValue;
-    if (!id || !title || !createdAt) throw new Error("Invalid stored record.");
+    if (!id || typeof title !== "string" || typeof createdAt !== "string") throw new Error("Invalid stored record.");
     recordId(id); return { id, title, createdAt };
   };
   return {
@@ -92,6 +92,6 @@ export function firestoreStore(project: string, collection = "platform_records",
       if (!response.ok) throw new Error("Data unavailable."); return decode(JSON.parse(await readText(response, 262_144)) as Parameters<typeof decode>[0]);
     },
     async remove(owner, id) { recordId(id); const result = await call(`${base}/${ownerPath(owner)}/${id}`, { method: "DELETE" }); if (!result.ok && result.status !== 404) throw new Error("Data unavailable."); },
-    async ready() { const response = await call(`${base}/${collection}/_health`); if (!response.ok && response.status !== 404) throw new Error("Data unavailable."); }, close() {},
+    async ready() { const response = await call(`${base}/${collection}?pageSize=1&mask.fieldPaths=createdAt`); if (!response.ok) throw new Error("Data unavailable."); await response.body?.cancel(); }, close() {},
   };
 }

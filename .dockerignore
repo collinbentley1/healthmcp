@@ -9,6 +9,7 @@ npmrc
 node_modules
 dist
 coverage
+**/gha-creds-*.json
 **/.terraform
 **/*.tfstate*
 **/*.tfplan*

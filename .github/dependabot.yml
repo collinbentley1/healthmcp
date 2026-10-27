@@ -14,4 +14,4 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      - dependency-name: "collinbentley1/platform"
+      - dependency-name: "collinbentley1/platform/*"

@@ -5,7 +5,7 @@ RUN bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
 
 FROM dependencies AS build
 COPY . .
-RUN bun --no-env-file run verify:ci
+RUN bun --no-env-file run verify:ci && mkdir -p /app/.local
 
 FROM dependencies AS production-dependencies
 ARG TARGETARCH
@@ -18,6 +18,7 @@ ENV NODE_ENV=production PORT=8080
 COPY --from=production-dependencies --chown=1000:1000 /app/node_modules ./node_modules
 COPY --from=production-dependencies --chown=1000:1000 /app/package.json /app/bun.lock ./
 COPY --from=build --chown=1000:1000 /app/dist ./dist
+COPY --from=build --chown=1000:1000 /app/.local ./.local
 USER 1000:1000
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/bun"]

@@ -68,7 +68,7 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
         : json({ error: "Internal server error.", requestId: id }, 500);
     }
     let method = "UNKNOWN"; let https = false;
-    try { method = request.method; https = new URL(options.origin ?? request.url).protocol === "https:"; } catch {}
+    try { method = request.method; https = Boolean(Bun.env.K_SERVICE) || new URL(options.origin ?? request.url).protocol === "https:"; } catch {}
     let headers = response.headers;
     const defaults = {
       "Content-Security-Policy": options.csp ?? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'",
