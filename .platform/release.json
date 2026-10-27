@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "sha": "dc8d6c1a6f8c619ca9c19904d6448544324d8c6d",
+  "managed": {
+    ".platform/runtime/data.ts": "09b06ea773fca08a938b63705614394e703fc0718cddf2a162c90fb26c65447d",
+    ".platform/runtime/http.ts": "01c853f57b5ccdc8521abed77dbbc8a00b0f20ec1494755e8bfded6e9a9d5079",
+    ".platform/runtime/package.json": "c8c8ea1a37e16f714743a9551a5a5e614aa387ad282ac307d191dcb556aa738d",
+    ".platform/runtime/auth.ts": "47aa35a3d9b70e4ff38dc6f337e013a35f55db388523640e26ecda7c4e0cb60e",
+    "Dockerfile": "3569d1450da341b977e1a93edc5bcbe55fb2674e4c30d13eba037accf87bf072",
+    ".dockerignore": "448c84a844a7493c401febed4f73fe96437174bca65d8b09d8c22efe21f40678",
+    "bunfig.toml": "3d78af3092dc25536b704b1141f04197c5df78d38972ba097a7e0fac58a3afc6",
+    ".github/workflows/application.yml": "78e743fc146d532f5ed78d22c0f00d464d8f167ae404a4ba98e988e67d36d458",
+    ".github/workflows/review-gate.yml": "d402b95b69d61fc93073125af5adc517ee63c271b59d35e45785c93526889dda",
+    ".github/dependabot.yml": "d99a76c3e0ef01e221112b8af8a24075d5830ffc782190d5a2e1628cadd3ecd3",
+    "tools/verify-socket-config.ts": "48355a37d809f0c5ae95102e2d3ec86dd5d01e7c9409a6ff38b86a228752dfa6"
+  }
+}
