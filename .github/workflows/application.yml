@@ -18,8 +18,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      checks: write
     with:
       pull_request: ${{ inputs.pull_request || '' }}
-      platform_sha: 97e093b361f39b8fa7da63d34b8cfa0e0ad62edf
-    uses: collinbentley1/platform/.github/workflows/application-v1.yml@97e093b361f39b8fa7da63d34b8cfa0e0ad62edf
+      platform_sha: cdd84d99b01f47c93c2dbd4e7c39a5d6380d67e5
+    uses: collinbentley1/platform/.github/workflows/application-v1.yml@cdd84d99b01f47c93c2dbd4e7c39a5d6380d67e5
