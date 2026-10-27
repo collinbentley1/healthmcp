@@ -24,5 +24,5 @@ jobs:
       checks: read
       actions: write
     with:
-      platform_sha: cdd84d99b01f47c93c2dbd4e7c39a5d6380d67e5
-    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@cdd84d99b01f47c93c2dbd4e7c39a5d6380d67e5
+      platform_sha: 1c9466bcb58fc43c90cb5232031963eb09726429
+    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@1c9466bcb58fc43c90cb5232031963eb09726429
