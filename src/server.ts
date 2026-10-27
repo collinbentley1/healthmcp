@@ -1,3 +1,4 @@
+import { secureHandler } from "../.platform/runtime/http.ts";
 import { realpath, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { BUILT_PUBLIC_DIR, getRuntimeConfig, type RuntimeConfig } from "./config.ts";
@@ -107,7 +108,7 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
   ".svg": "image/svg+xml",
 };
 
-export function createHandler(dependencies: ServerDependencies = {}): (request: Request) => Promise<Response> {
+function applicationHandler(dependencies: ServerDependencies = {}): (request: Request) => Promise<Response> {
   const config = dependencies.config ?? getRuntimeConfig();
   const firestoreClient = config.waitlistBackend === "firestore" && config.firestoreProjectId
     ? new FirestoreClient({
@@ -254,6 +255,8 @@ export function createHandler(dependencies: ServerDependencies = {}): (request: 
     }
   };
 }
+
+export function createHandler(dependencies: ServerDependencies = {}): (request: Request) => Promise<Response> { return secureHandler(applicationHandler(dependencies)); }
 
 export const handleRequest = createHandler();
 

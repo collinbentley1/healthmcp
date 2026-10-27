@@ -4,21 +4,6 @@ import { join } from "node:path";
 const root = join(import.meta.dir, "..");
 const failures: string[] = [];
 
-await requireContains(
-  "Dockerfile",
-  "FROM platform.invalid/bun-release AS bun-release",
-  "Dockerfile must retain the platform-injected Bun release base.",
-);
-await requireContains(
-  "Dockerfile",
-  "FROM platform.invalid/dhi-bun-dev AS deps",
-  "Dockerfile must retain the platform-injected DHI development base.",
-);
-await requireContains(
-  "Dockerfile",
-  "FROM platform.invalid/dhi-bun-runtime AS runtime",
-  "Dockerfile must retain the platform-injected DHI runtime base.",
-);
 await requireContains("public/index.html", 'rel="icon"', "The document must link a favicon.");
 await requireContains("tools/build.ts", "scan.html", "The production build must include the scan handoff page.");
 await requireContains("src/mcp.ts", "createMcpHandler", "MCP must use the SDK's per-request HTTP handler factory.");
