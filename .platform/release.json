@@ -1,17 +1,20 @@
 {
   "schemaVersion": 1,
-  "sha": "97e093b361f39b8fa7da63d34b8cfa0e0ad62edf",
+  "sha": "cdd84d99b01f47c93c2dbd4e7c39a5d6380d67e5",
   "managed": {
+    ".platform/runtime/application.ts": "8236c1d683d2fad3d0ede070a81206cd2d06fd8fb585f4266605d97b934ca6bb",
     ".platform/runtime/auth.ts": "47aa35a3d9b70e4ff38dc6f337e013a35f55db388523640e26ecda7c4e0cb60e",
-    ".platform/runtime/data.ts": "15a6c2b7e64dccd2a154d7fab588e8f9c96c8e07b52b1291ccc5e795dfa9b4ea",
-    ".platform/runtime/http.ts": "6137ae3539b43f6df1bad5b28e6b06972504e88b3818c6f40c41d4b57b3d1769",
-    ".platform/runtime/package.json": "6d3e94c5cb907066caaad789e51a0ef45ef1349d49e2ecacf98a4555dffe731d",
-    "Dockerfile": "3569d1450da341b977e1a93edc5bcbe55fb2674e4c30d13eba037accf87bf072",
+    ".platform/runtime/data.ts": "cbd4211696ec2f54d2c836549c64ff2f192169eca94d5ca1747bdc7e93fa7a5c",
+    ".platform/runtime/http.ts": "384566986e67cfd62d4aece73f00972fd4b571f2de021d157f08125de42121d6",
+    ".platform/runtime/identity.ts": "7584a4098c339d0f6b6583fc524dd68db69ff1aa095d8d44c7b68bc6b24c3bda",
+    ".platform/runtime/package.json": "00c1097a728e7d0fe7bf9282f05c49b6953a974971e2daecd530c71b426b91c8",
+    "Dockerfile": "91e5a86cd9c20aca216ac8975ecc024054ccbfd4eecd91dad6450e9328a85bb5",
     ".dockerignore": "0d31f02183e29c6e6ca4b496686ff3a31fb56c8b5b39c8f12050f824988eb11c",
     "bunfig.toml": "3d78af3092dc25536b704b1141f04197c5df78d38972ba097a7e0fac58a3afc6",
-    ".github/workflows/application.yml": "17f28661535cce15ace05439d00f897cbfa05cbb71c31ca76ee032d0701f3c2b",
-    ".github/workflows/review-gate.yml": "9be4daa8efe677e6707f0eb8dfa6ca55af0bf853047efe38c39c1d29c1bf4687",
-    ".github/dependabot.yml": "d99a76c3e0ef01e221112b8af8a24075d5830ffc782190d5a2e1628cadd3ecd3",
+    ".github/workflows/application.yml": "77eb2604a04c104930573b6b0374268b69febbd61368532ec81fbff1d069ea46",
+    ".github/workflows/security.yml": "4aeaf2d5560d9984fdf07d52ce9e66f7667c6941e4495be4f06df865cbc216fa",
+    ".github/workflows/review-gate.yml": "18442db6a6ad41a2c5862fd8db7260a26c1c4f32be5c4fcebf1f532d685cbf57",
+    ".github/dependabot.yml": "a546fbfd215c31ef83c86a96770cf77c55f7ff5a981c56fb353bf401122ad486",
     "tools/verify-socket-config.ts": "48355a37d809f0c5ae95102e2d3ec86dd5d01e7c9409a6ff38b86a228752dfa6"
   }
 }

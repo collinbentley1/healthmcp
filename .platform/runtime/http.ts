@@ -90,7 +90,7 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
       if (/^[a-f0-9]{40}$/.test(Bun.env.PLATFORM_SOURCE_SHA ?? "") && /^[a-f0-9]{40}$/.test(Bun.env.PLATFORM_RELEASE_SHA ?? "")) { headers.set("X-Platform-Source", Bun.env.PLATFORM_SOURCE_SHA!); headers.set("X-Platform-Release", Bun.env.PLATFORM_RELEASE_SHA!); }
     };
     try { apply(); } catch { response = new Response(response.body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) }); headers = response.headers; apply(); }
-    options.log?.({ requestId: id, method, status: response.status, durationMs: Math.round(performance.now() - start) });
+    options.log?.({ severity: response.status >= 500 ? "ERROR" : response.status >= 400 ? "WARNING" : "INFO", requestId: id, method, status: response.status, durationMs: Math.round(performance.now() - start) });
     // Preserve Bun.file bodies so their framing and sendfile behavior survive middleware.
     return method === "HEAD" && response.body !== null ? new Response(null, { status: response.status, statusText: response.statusText, headers }) : response;
   };
