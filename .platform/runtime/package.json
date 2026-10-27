@@ -10,7 +10,7 @@
     "./identity": "./identity.ts"
   },
   "dependencies": {
-    "jose": "6.2.12",
+    "jose": "6.2.13",
     "firebase-admin": "14.5.0",
     "rate-limiter-flexible": "11.2.3"
   }

@@ -27,7 +27,7 @@
     "@cfworker/json-schema": "4.1.1",
     "@modelcontextprotocol/server": "2.3.0",
     "zod": "4.6.6",
-    "jose": "6.2.12"
+    "jose": "6.2.13"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.3.1",
