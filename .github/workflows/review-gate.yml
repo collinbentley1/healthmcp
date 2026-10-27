@@ -7,6 +7,8 @@ on:
     types: [created, edited]
   pull_request_review:
     types: [submitted]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
 
 permissions: {}
 
@@ -18,5 +20,5 @@ jobs:
       pull-requests: read
       checks: write
     with:
-      platform_sha: dc8d6c1a6f8c619ca9c19904d6448544324d8c6d
-    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@dc8d6c1a6f8c619ca9c19904d6448544324d8c6d
+      platform_sha: 625ba0bd3ba52e001715588e703916d0dfd7f32c
+    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@625ba0bd3ba52e001715588e703916d0dfd7f32c

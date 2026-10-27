@@ -40,7 +40,9 @@ export async function readText(request: Pick<Request, "headers" | "body">, maxim
 }
 
 export function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
-  return Response.json(value, { status, headers: { "Cache-Control": "no-store", ...Object.fromEntries(new Headers(headers)) } });
+  const response = Response.json(value, { status, headers: { "Cache-Control": "no-store", ...Object.fromEntries(new Headers(headers)) } });
+  response.headers.set("Content-Length", String(new TextEncoder().encode(JSON.stringify(value)).byteLength));
+  return response;
 }
 
 export function requireOrigin(request: Request, origin: string): void {

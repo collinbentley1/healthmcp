@@ -1,3 +1,4 @@
+import { cachedReadiness } from "../.platform/runtime/data.ts";
 import { secureHandler } from "../.platform/runtime/http.ts";
 import { realpath, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
@@ -117,6 +118,7 @@ function applicationHandler(dependencies: ServerDependencies = {}): (request: Re
       projectId: config.firestoreProjectId,
     })
     : undefined;
+  const ready = cachedReadiness(dependencies.ready ?? (async () => { await firestoreClient?.ready(config.firestoreCollection); }));
   const waitlistStore = dependencies.waitlistStore ?? createWaitlistStore(config, firestoreClient);
   // Firestore decides whether a request is abusive whenever this service is
   // deployed. The in-process limiter below it is a cheap first pass only; it
@@ -185,8 +187,9 @@ function applicationHandler(dependencies: ServerDependencies = {}): (request: Re
     if(healthUrl.pathname==="/readyz") {
       if(request.method!=="GET" && request.method!=="HEAD") return text("method not allowed",{headers:{Allow:"GET, HEAD"},status:405});
       let ok=true;
-      try {if(dependencies.ready) await dependencies.ready();else await firestoreClient?.ready(config.firestoreCollection);} catch {ok=false;}
-      const response=json({ok},{status:ok?200:503});
+      try {await ready();} catch {ok=false;}
+      const payload={ok};
+      const response=json(payload,{status:ok?200:503,headers:{"Content-Length":String(UTF8.encode(JSON.stringify(payload)).byteLength)}});
       return request.method==="HEAD"?withoutBody(response):response;
     }
 
