@@ -3,12 +3,8 @@ name: Automated review
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
-  issue_comment:
-    types: [created, edited]
   pull_request_review:
-    types: [submitted]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
+    types: [submitted, edited, dismissed]
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
@@ -22,6 +18,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      actions: write
     with:
-      platform_sha: 97e093b361f39b8fa7da63d34b8cfa0e0ad62edf
-    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@97e093b361f39b8fa7da63d34b8cfa0e0ad62edf
+      platform_sha: cafbb495efcf9ceeaf583dbe47f8977ef849d7d3
+    uses: collinbentley1/platform/.github/workflows/review-gate-v1.yml@cafbb495efcf9ceeaf583dbe47f8977ef849d7d3

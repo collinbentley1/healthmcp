@@ -1,0 +1,18 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '31 7 * * 1'
+
+permissions: {}
+
+jobs:
+  run:
+    name: CodeQL
+    permissions:
+      contents: read
+      security-events: write
+    uses: collinbentley1/platform/.github/workflows/security-v1.yml@cafbb495efcf9ceeaf583dbe47f8977ef849d7d3

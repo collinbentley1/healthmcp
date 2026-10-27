@@ -1,17 +1,1 @@
-version: 2
-updates:
-  - package-ecosystem: bun
-    directory: /
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    groups:
-      dependencies:
-        patterns: ["*"]
-  - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-    ignore:
-      - dependency-name: "collinbentley1/platform/*"
+{version: 2,updates: [{package-ecosystem: bun,directory: /,schedule: {interval: weekly},cooldown: {default-days: 7},groups: {dependencies: {patterns: ["*"]}},ignore: [{dependency-name: firebase-admin},{dependency-name: jose},{dependency-name: rate-limiter-flexible}]},{package-ecosystem: github-actions,directory: /,schedule: {interval: weekly},ignore: [{dependency-name: collinbentley1/platform/*}]}]}

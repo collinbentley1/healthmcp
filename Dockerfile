@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS dependencies
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS dependencies
 WORKDIR /app
 COPY package.json bun.lock bunfig.toml ./
 RUN bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
@@ -12,7 +12,7 @@ ARG TARGETARCH
 ARG TARGETOS
 RUN if [ "$TARGETARCH" = "amd64" ]; then target_cpu=x64; else target_cpu="$TARGETARCH"; fi; rm -rf node_modules && bun ci --cpu="$target_cpu" --os="$TARGETOS" --production --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
 
-FROM oven/bun:1.4.2-distroless@sha256:1a0c31c7c5f9d193aedf60fe1cebdeb76ac8f6e29f24be8dd8cbd6df72df26ec
+FROM oven/bun:1.4.4-distroless@sha256:153a951ae40106e125898103e6e990ee0f38e6aee7f561029e26cf9fbed23470
 WORKDIR /app
 ENV NODE_ENV=production PORT=8080
 COPY --from=production-dependencies --chown=1000:1000 /app/node_modules ./node_modules

@@ -21,5 +21,5 @@ jobs:
       checks: write
     with:
       pull_request: ${{ inputs.pull_request || '' }}
-      platform_sha: 97e093b361f39b8fa7da63d34b8cfa0e0ad62edf
-    uses: collinbentley1/platform/.github/workflows/application-v1.yml@97e093b361f39b8fa7da63d34b8cfa0e0ad62edf
+      platform_sha: cafbb495efcf9ceeaf583dbe47f8977ef849d7d3
+    uses: collinbentley1/platform/.github/workflows/application-v1.yml@cafbb495efcf9ceeaf583dbe47f8977ef849d7d3
