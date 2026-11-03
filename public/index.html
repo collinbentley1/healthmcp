@@ -3,154 +3,73 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta
-      name="description"
-      content="Medlock lets you unlock AI insights without unlocking your private health data."
-    />
+    <meta name="description" content="Medlock. Private health sharing with AI, coming soon. Join the early-access waitlist." />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Medlock" />
-    <meta property="og:title" content="Medlock — unlock AI insights without unlocking your private health data" />
-    <meta
-      property="og:description"
-      content="A privacy-preserving health-data MCP server and site. This public deployment serves demo Solid Pod data until a user connects their own pod."
-    />
+    <meta property="og:title" content="Medlock — privately share your health info" />
+    <meta property="og:description" content="Private health sharing with AI, coming soon. Join the early-access waitlist." />
     <meta property="og:url" content="https://medlock.ai/" />
-    <meta property="og:image" content="https://medlock.ai/assets/og-image.png" />
-    <meta property="og:image:width" content="1200" />
-    <meta property="og:image:height" content="630" />
-    <meta
-      property="og:image:alt"
-      content="Medlock wordmark with the tagline: unlock AI insights without unlocking your private health data."
-    />
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Medlock — unlock AI insights without unlocking your private health data" />
-    <meta
-      name="twitter:description"
-      content="A privacy-preserving health-data MCP server and site. This public deployment serves demo Solid Pod data until a user connects their own pod."
-    />
-    <meta name="twitter:image" content="https://medlock.ai/assets/og-image.png" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Medlock — privately share your health info" />
     <title>Medlock</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/assets/styles.css?v=2" />
-    <script type="module" src="/assets/client.js?v=2"></script>
+    <link rel="stylesheet" href="/assets/styles.css?v=4" />
+    <script type="module" src="/assets/client.js?v=3"></script>
   </head>
   <body>
-    <header class="topbar" aria-label="Primary">
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="topbar">
       <a class="brand" href="/" aria-label="Medlock home">
-        <span class="brand-mark" aria-hidden="true"></span>
+        <img src="/favicon.svg" width="28" height="28" alt="" />
         <span>Medlock</span>
       </a>
-      <nav class="nav" aria-label="Sections">
-        <a href="#mcp">MCP</a>
-        <a href="#privacy">Privacy</a>
-        <a href="#waitlist">Waitlist</a>
-      </nav>
+      <span class="access-label">Early access</span>
     </header>
-
-    <main>
+    <main class="home" id="main">
       <section class="hero" aria-labelledby="hero-title">
-        <div class="hero-copy">
-          <p class="eyebrow">Private health data, user-approved AI context</p>
-          <h1 id="hero-title">
-            <span>Unlock AI insights</span>
-            <span>without unlocking</span>
-            <span>your private health data</span>
-          </h1>
-          <p class="lede">
-            Medlock lets you team up your favorite model with your health records on your terms. There is no good reason
-            to hand any company permanent, all-access rights to your most personal story.
-          </p>
-          <div class="actions">
-            <a class="button primary" href="#waitlist">Reserve My Pod</a>
-            <a class="button secondary" href="/api/mcp">MCP endpoint</a>
-          </div>
-        </div>
-
-        <div class="endpoint-panel" id="mcp" aria-label="MCP endpoint summary">
-          <div class="panel-header">
-            <span class="panel-title">/api/mcp</span>
-            <span class="status-pill">Streamable HTTP</span>
-          </div>
-          <div class="flow-diagram" aria-hidden="true">
-            <div class="node">Solid Pod</div>
-            <div class="connector"></div>
-            <div class="node active">Medlock</div>
-            <div class="connector"></div>
-            <div class="node">AI Client</div>
-          </div>
-          <dl class="facts">
-            <div>
-              <dt>Transport</dt>
-              <dd>Streamable HTTP</dd>
-            </div>
-            <div>
-              <dt>Runtime</dt>
-              <dd>Bun on Cloud Run</dd>
-            </div>
-            <div>
-              <dt>Tools</dt>
-              <dd>solid_fetch_vitals, vitals_scan</dd>
-            </div>
-          </dl>
-        </div>
-      </section>
-
-      <section class="band" id="privacy" aria-labelledby="privacy-title">
-        <div class="section-copy">
-          <p class="eyebrow">How it works</p>
-          <h2 id="privacy-title">Bring your data, keep your privacy.</h2>
-        </div>
-        <div class="principles">
-          <article>
-            <h3>1 · Keep It Yours</h3>
-            <p>
-              Drop every metric, from steps to meds to labs, into a Solid Pod encrypted with your keys. Medlock never
-              stores a copy, and nothing moves unless you say so.
-            </p>
-          </article>
-          <article>
-            <h3>2 · Share Precisely</h3>
-            <p>
-              One chat request becomes one short-lived, signed link. Approve automatically, ask each time, or revoke in
-              one tap.
-            </p>
-          </article>
-          <article>
-            <h3>3 · Enjoy the Edge</h3>
-            <p>
-              Your model gets the context it needs to coach, predict, and inspire, with zero long-term custody of your
-              life&apos;s data.
-            </p>
-          </article>
-        </div>
-      </section>
-
-      <section class="quote-band" aria-labelledby="proof-title">
-        <div class="checkmark" aria-hidden="true"></div>
-        <h2 id="proof-title" class="sr-only">Early access result</h2>
-        <blockquote>
-          I let ChatGPT compare my marathon training logs and sleep data, then got tweaks that shaved 4 minutes off my
-          10 K, yet everything stayed in my pod.
-        </blockquote>
-        <p>Early-access runner #12</p>
-      </section>
-
-      <section class="waitlist" id="waitlist" aria-labelledby="waitlist-title">
-        <div class="section-copy">
-          <p class="eyebrow">Early access</p>
-          <h2 id="waitlist-title">Beta opens soon. Bring your data, keep your privacy.</h2>
-        </div>
+        <p class="eyebrow" id="hero-status">Coming soon</p>
+        <h1 id="hero-title" aria-describedby="hero-status">Privately share<br /><span>your health info</span></h1>
+        <p class="hero-clients">
+          <span>with</span>
+          <span class="client-name"><img src="/assets/claude.svg" width="32" height="32" alt="" /><span>Claude</span></span>
+          <span class="client-and">and</span>
+          <span class="client-name"><img src="/assets/openai.svg" width="32" height="32" alt="" /><span>ChatGPT</span></span>
+        </p>
         <form class="waitlist-form" data-waitlist-form>
-          <label for="email">Email</label>
+          <label for="email">Join the waitlist</label>
           <div class="input-row">
-            <input id="email" data-waitlist-email name="email" type="email" autocomplete="email" placeholder="you@example.com" required />
-            <button type="submit">Request Invite</button>
+            <input id="email" data-waitlist-email name="email" type="email" autocomplete="email" placeholder="Your email" required maxlength="254" aria-describedby="waitlist-status waitlist-privacy" />
+            <button type="submit">Join waitlist</button>
           </div>
-          <p class="form-status" data-waitlist-status aria-live="polite"></p>
-          <p class="fine-print">No spam or hidden trackers. Protected by reCAPTCHA Enterprise; Google’s Privacy Policy and Terms of Service apply.</p>
+          <p class="form-status" id="waitlist-status" data-waitlist-status role="status" aria-live="polite"></p>
+          <p class="fine-print" id="waitlist-privacy">Your email is used for waitlist confirmation and early-access updates.</p>
+          <noscript><p class="fine-print">Enable JavaScript to join the waitlist.</p></noscript>
         </form>
       </section>
+      <div class="support">
+        <details id="mcp">
+          <summary>MCP connection</summary>
+          <div class="details-body">
+            <label for="endpoint">Server URL</label>
+            <div class="endpoint-row">
+              <input id="endpoint" data-mcp-endpoint type="url" value="https://medlock.ai/api/mcp" readonly spellcheck="false" />
+              <button class="quiet-button" type="button" data-copy-endpoint>Copy URL</button>
+            </div>
+            <p class="form-status" data-copy-status role="status" aria-live="polite"></p>
+            <p>Custom MCP connection: Claude or ChatGPT developer mode. Sample data only; no personal health records are connected.</p>
+            <p class="fine-print">Not medical advice. Camera vitals scanning is unavailable.</p>
+          </div>
+        </details>
+        <details id="privacy">
+          <summary>Privacy &amp; safety</summary>
+          <div class="details-body">
+            <p>The waitlist stores your email and hashed browser identifiers. It uses reCAPTCHA Enterprise for abuse protection. Google’s <a href="https://policies.google.com/privacy">Privacy Policy</a> and <a href="https://policies.google.com/terms">Terms of Service</a> apply.</p>
+            <p>Personal health-data access is planned for private deployments with authentication. It is not available on this public site.</p>
+            <p class="fine-print">Sample MCP readings must not be used for diagnosis or treatment.</p>
+          </div>
+        </details>
+      </div>
     </main>
-    <footer class="footer">Medlock · Your data, your decisions.</footer>
+    <footer class="footer">Medlock</footer>
   </body>
 </html>

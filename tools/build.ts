@@ -40,6 +40,9 @@ await Bun.write(
 );
 await Bun.write(join(distPublicDir, "favicon.svg"), Bun.file(join(publicDir, "favicon.svg")));
 await Bun.write(join(distPublicDir, "assets", "styles.css"), Bun.file(join(publicDir, "assets", "styles.css")));
+for (const icon of ["claude.svg", "openai.svg"]) {
+  await Bun.write(join(distPublicDir, "assets", icon), Bun.file(join(publicDir, "assets", icon)));
+}
 await Bun.write(join(distPublicDir, "assets", "og-image.png"), Bun.file(join(publicDir, "assets", "og-image.png")));
 
 function assertBuild(result: Bun.BuildOutput, label: string): void {

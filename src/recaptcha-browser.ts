@@ -29,7 +29,11 @@ const RECAPTCHA_TIMEOUT_MS = 10_000;
 export async function executeWaitlistRecaptcha(
   kind: "confirm" | "join",
 ): Promise<string> {
-  const config = await (ready ??= loadRecaptcha());
+  const config = await (ready ??= loadRecaptcha().catch((error: unknown) => {
+    ready = undefined;
+    document.querySelector("script[data-recaptcha-enterprise]")?.remove();
+    throw error;
+  }));
   const action = config.actions[kind];
   const api = window.grecaptcha?.enterprise;
   if (!api) throw new Error("reCAPTCHA did not initialize");

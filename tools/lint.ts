@@ -261,7 +261,11 @@ async function rejectContains(path: string, needle: string, message: string): Pr
 
 async function rejectExternalReferences(path: string, sameOriginPrefix: string, message: string): Promise<void> {
   const text = await readFile(join(root, path), "utf8");
-  if (text.replaceAll(sameOriginPrefix, "").includes("https://")) {
+  const withoutLegalLinks = text.replace(
+    /href="https:\/\/policies\.google\.com\/(?:privacy|terms)"/g,
+    'href=""',
+  );
+  if (withoutLegalLinks.replaceAll(sameOriginPrefix, "").includes("https://")) {
     failures.push(`${path}: ${message}`);
   }
 }

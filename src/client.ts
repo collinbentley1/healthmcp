@@ -3,12 +3,28 @@ import { executeWaitlistRecaptcha } from "./recaptcha-browser.ts";
 const form = document.querySelector<HTMLFormElement>("[data-waitlist-form]");
 const emailInput = document.querySelector<HTMLInputElement>("[data-waitlist-email]");
 const statusText = document.querySelector<HTMLElement>("[data-waitlist-status]");
+const submitButton = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
+const endpointInput = document.querySelector<HTMLInputElement>("[data-mcp-endpoint]");
+const copyButton = document.querySelector<HTMLButtonElement>("[data-copy-endpoint]");
+const copyStatus = document.querySelector<HTMLElement>("[data-copy-status]");
+
+copyButton?.addEventListener("click", async () => {
+  if (!endpointInput || !copyStatus) return;
+  try {
+    await navigator.clipboard.writeText(endpointInput.value);
+    copyStatus.textContent = "Copied.";
+  } catch {
+    endpointInput.focus();
+    endpointInput.select();
+    copyStatus.textContent = "Select and copy the server URL.";
+  }
+});
 
 form?.addEventListener("submit", async (event) => {
   event.preventDefault();
 
   const email = emailInput?.value.trim() ?? "";
-  if (!emailInput || !statusText) {
+  if (!emailInput || !statusText || !submitButton || submitButton.disabled) {
     return;
   }
 
@@ -18,6 +34,9 @@ form?.addEventListener("submit", async (event) => {
   }
 
   setStatus("Joining...", "pending");
+  submitButton.disabled = true;
+  submitButton.textContent = "Joining…";
+  form?.setAttribute("aria-busy", "true");
 
   try {
     const recaptchaToken = await executeWaitlistRecaptcha("join");
@@ -26,6 +45,7 @@ form?.addEventListener("submit", async (event) => {
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
     });
     const body = (await response.json()) as { error?: string; ok?: boolean };
 
@@ -35,13 +55,13 @@ form?.addEventListener("submit", async (event) => {
     }
 
     emailInput.value = "";
-    // One message for every accepted address. The page used to say "You're
-    // already on the waitlist" for a known address and something else for a new
-    // one, which turned the form into a membership oracle that needed no API
-    // knowledge at all -- anyone could type an address and read the answer.
     setStatus("Thanks. Check your inbox to confirm your address.", "success");
   } catch {
-    setStatus("Unable to join right now.", "error");
+    setStatus("Unable to join right now. Please try again.", "error");
+  } finally {
+    submitButton.disabled = false;
+    submitButton.textContent = "Join waitlist";
+    form?.setAttribute("aria-busy", "false");
   }
 });
 

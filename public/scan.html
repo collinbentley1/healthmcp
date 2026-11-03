@@ -3,27 +3,23 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta
-      name="description"
-      content="Local-first scan handoff page for Medlock's vitals_scan MCP tool. Camera vitals scanning is not enabled in this public deployment."
-    />
-    <title>Medlock Scan</title>
+    <meta name="description" content="Medlock camera scan handoff. Camera vitals scanning is unavailable on this public site." />
+    <title>Scan · Medlock</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/assets/styles.css?v=2" />
+    <link rel="stylesheet" href="/assets/styles.css?v=3" />
   </head>
   <body>
-    <main class="scan-page">
-      <a class="brand" href="/" aria-label="Medlock home">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <span>Medlock</span>
-      </a>
-      <section class="scan-panel" aria-labelledby="scan-title">
-        <p class="eyebrow">Local-first scan handoff</p>
-        <h1 id="scan-title">Camera vitals scanning is not enabled in this public deployment.</h1>
-        <p>
-          The MCP tool returns this page as a safe handoff target. Private deployments can attach a browser-side scan
-          flow here without allowing the server to activate a camera.
-        </p>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Medlock home"><img src="/favicon.svg" width="28" height="28" alt="" /><span>Medlock</span></a>
+    </header>
+    <main class="utility-page" id="main">
+      <section aria-labelledby="scan-title">
+        <p class="eyebrow">Camera scan</p>
+        <h1 id="scan-title">Scanning is unavailable.</h1>
+        <p>Camera vitals scanning is not enabled on this public site. No camera access is requested.</p>
+        <p class="fine-print">Not medical advice.</p>
+        <a class="home-link" href="/">Back to Medlock</a>
       </section>
     </main>
   </body>
